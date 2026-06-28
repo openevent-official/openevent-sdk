@@ -25,7 +25,7 @@ enum ChannelFilter {
 // 公共消息类型
 // ============================================================================
 
-message Message {
+message EventMessage {
     uint64 seq = 1;               // 全局严格连续编号，从 1 开始
     uint64 ts_ms = 2;             // 服务端收到写入请求的 Unix 毫秒时间戳
     uint64 channel_id = 3;
@@ -96,12 +96,13 @@ message FetchRequest {
     uint64 from_seq = 3;          // 起始 seq（含），0 = 从当前 max_seq 之后开始
     uint32 limit = 4;             // 最大返回可见消息条数，必填，范围 1~1000
     bool only_my_recipient = 5;   // 为 true 时仅返回 recipients 包含 principal 的消息
+    repeated uint64 channels = 6;  // 仅返回指定 channel_id 的消息；为空表示不过滤 channel
 }
 
 message FetchResponse {
-    repeated Message messages = 1;
-    bool has_more = 2;
+    repeated EventMessage messages = 1;
     uint64 next_seq = 3;
+    uint64 last_seq = 2;
 }
 
 message SubscribeRequest {
@@ -113,7 +114,7 @@ message SubscribeRequest {
 
 message SubscribeResponse {
     oneof result {
-        Message message = 1;      // 正常订阅推送的消息
+        EventMessage message = 1; // 正常订阅推送的消息
         uint64 next_seq = 2;      // from_seq > max_seq 时返回建议下一次起点并结束 stream
     }
 }

@@ -70,12 +70,20 @@ def test_publish_auto_seq_and_fetch_round_trip(admin: AdminClient, client: OpenE
         payload=b"hello e2e",
     )
     status = client.get_status(principal=principal, token=token)
-    fetched = client.fetch(principal=principal, token=token, from_seq=1, limit=1000)
+    fetched = client.fetch(
+        principal=principal,
+        token=token,
+        from_seq=1,
+        limit=1000,
+        channels=[channel.channel_id],
+    )
 
     matches = [message for message in fetched.messages if message.seq == published.seq]
     assert channel.channel_id > 0
     assert published.seq > 0
     assert status.max_seq >= published.seq
+    assert fetched.last_seq >= published.seq
+    assert fetched.next_seq > 0
     assert len(matches) == 1
     assert matches[0].channel_id == channel.channel_id
     assert matches[0].principal == principal
@@ -195,6 +203,70 @@ def test_recipients_filtering(admin: AdminClient, client: OpenEventClient) -> No
     assert [message.payload for message in recipient_messages] == [b"direct recipient"]
     assert b"direct recipient" not in [message.payload for message in other_messages]
     assert b"broadcast without recipients" not in [message.payload for message in recipient_messages]
+
+
+def test_fetch_channel_filter_and_last_seq(admin: AdminClient, client: OpenEventClient) -> None:
+    principal = 1351
+    token = _token(admin, principal)
+    first_channel_id = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-fetch-first"),
+        visibility=openevent_pb2.VISIBILITY_PUBLIC,
+    ).channel.channel_id
+    second_channel_id = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-fetch-second"),
+        visibility=openevent_pb2.VISIBILITY_PUBLIC,
+    ).channel.channel_id
+
+    first_seq = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=first_channel_id,
+        payload=b"fetch first channel",
+    ).seq
+    second_seq = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=second_channel_id,
+        payload=b"fetch second channel",
+    ).seq
+    max_published_seq = max(first_seq, second_seq)
+
+    first_fetch = client.fetch(
+        principal=principal,
+        token=token,
+        from_seq=first_seq,
+        limit=1000,
+        channels=[first_channel_id],
+    )
+    second_fetch = client.fetch(
+        principal=principal,
+        token=token,
+        from_seq=first_seq,
+        limit=1000,
+        channels=[second_channel_id],
+    )
+    all_fetch = client.fetch(
+        principal=principal,
+        token=token,
+        from_seq=first_seq,
+        limit=1000,
+        channels=[],
+    )
+
+    assert b"fetch first channel" in [message.payload for message in first_fetch.messages]
+    assert b"fetch second channel" not in [message.payload for message in first_fetch.messages]
+    assert b"fetch second channel" in [message.payload for message in second_fetch.messages]
+    assert b"fetch first channel" not in [message.payload for message in second_fetch.messages]
+    assert {b"fetch first channel", b"fetch second channel"}.issubset(
+        {message.payload for message in all_fetch.messages}
+    )
+    for response in (first_fetch, second_fetch, all_fetch):
+        assert response.last_seq >= max_published_seq
+        assert response.next_seq > response.last_seq
 
 
 def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: OpenEventClient) -> None:

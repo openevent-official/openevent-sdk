@@ -104,16 +104,22 @@ response = client.fetch(
     token=token,
     from_seq=1,
     limit=100,
+    channels=[channel_id],
 )
 
 for message in response.messages:
     print(message.seq, message.channel_id, message.payload)
 
 next_seq = response.next_seq
+last_seq = response.last_seq
 ```
 
-Use the previous response's `next_seq` as the next `from_seq` to continue
-reading.
+`response.messages` contains `EventMessage` values. Pass `channels=[...]` to
+fetch only selected channels; omit it or pass an empty list to fetch all channels
+visible to the caller. Use the previous response's `next_seq` as the next
+`from_seq` to continue reading. If `next_seq <= last_seq`, another fetch may scan
+more committed messages; if `next_seq > last_seq`, the response has reached the
+current committed tail.
 
 To fetch only messages targeted to the current principal:
 
@@ -123,6 +129,7 @@ response = client.fetch(
     token=token,
     from_seq=1,
     limit=100,
+    channels=[channel_id],
     only_my_recipient=True,
 )
 ```

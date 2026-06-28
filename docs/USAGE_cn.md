@@ -101,15 +101,20 @@ response = client.fetch(
     token=token,
     from_seq=1,
     limit=100,
+    channels=[channel_id],
 )
 
 for message in response.messages:
     print(message.seq, message.channel_id, message.payload)
 
 next_seq = response.next_seq
+last_seq = response.last_seq
 ```
 
-继续读取时，把上一次响应的 `next_seq` 作为新的 `from_seq`。
+`response.messages` 包含 `EventMessage`。传入 `channels=[...]` 时只读取指定 channel；
+省略或传空列表时读取调用方可见的所有 channel。继续读取时，把上一次响应的 `next_seq`
+作为新的 `from_seq`。如果 `next_seq <= last_seq`，继续 Fetch 可能还会扫描到更多已提交消息；
+如果 `next_seq > last_seq`，表示本次响应已经到达当前已提交尾部。
 
 如果只想读取定向发送给自己的消息：
 
@@ -119,6 +124,7 @@ response = client.fetch(
     token=token,
     from_seq=1,
     limit=100,
+    channels=[channel_id],
     only_my_recipient=True,
 )
 ```

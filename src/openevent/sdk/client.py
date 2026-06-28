@@ -65,6 +65,7 @@ class OpenEventClient:
         from_seq: int,
         limit: int,
         only_my_recipient: bool = False,
+        channels: Iterable[int] = (),
     ):
         return self.event_stub.Fetch(
             openevent_pb2.FetchRequest(
@@ -72,6 +73,7 @@ class OpenEventClient:
                 token=token,
                 from_seq=from_seq,
                 limit=limit,
+                channels=list(channels),
                 only_my_recipient=only_my_recipient,
             )
         )

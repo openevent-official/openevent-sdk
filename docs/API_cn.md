@@ -14,7 +14,7 @@
 - 所有接口通过 `gRPC + Protocol Buffers` 提供。
 - 除 `AdminService` 外，业务请求都携带 `principal + token`。
 - 客户端只依赖 `seq` 作为消息位置；任何内部 offset 不属于公开协议。
-- 每条已写入消息包含 `ts_ms`，表示服务端收到写入请求时的 Unix 毫秒时间戳。
+- 每条已写入日志记录以 `EventMessage` 返回，其中包含 `ts_ms`，表示服务端收到写入请求时的 Unix 毫秒时间戳。
 - `payload` 是不透明字节数组，OpenEvent 不解析内容，也不做 schema 校验。
 
 - OpenEvent 保留全部已提交历史消息，Channel 创建后持续保留
@@ -149,23 +149,27 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 
 - token 与 `principal` 匹配。
 - `limit` 必须在 `1..1000`，否则返回 `INVALID_ARGUMENT`。
+- `channels` 是可选 channel id 过滤条件。为空时扫描调用方可见的所有 channel；非空时只返回这些
+  channel 中调用方有读取权限的消息。
 - `only_my_recipient=true` 时只返回 `recipients` 包含当前 `principal` 的消息。
 
 起点语义：
 
 | `from_seq` | 行为 |
 |------------|------|
-| `0` | 返回空结果，`next_seq=max_seq+1` |
-| `> max_seq` | 返回空结果，`next_seq=max_seq+1` |
+| `0` | 返回空结果，`next_seq=max_seq+1`，`last_seq=max_seq` |
+| `> max_seq` | 返回空结果，`next_seq=max_seq+1`，`last_seq=max_seq` |
 | `1..max_seq` | 从该 seq 开始扫描并返回可见消息 |
 
 响应语义：
 
-- `messages` 最多包含 `limit` 条可见消息。
+- `messages` 最多包含 `limit` 条经过 ACL、`channels` 和 recipient 过滤后的可见 `EventMessage`。
 - 每条 `messages` 都包含写入时生成的 `ts_ms`。
 - `next_seq` 表示下一次继续读取的建议起点。
-- `has_more=true` 表示从 `next_seq` 继续可能还有后续全局消息。
-- ACL 或 recipient 过滤不会让 `next_seq` 回退。
+- `last_seq` 表示本次 Fetch 响应观察到的最高已提交全局 seq。
+- 如果 `next_seq <= last_seq`，调用方可以继续从 `next_seq` 扫描；如果 `next_seq > last_seq`，
+  表示本次 Fetch 已到达当前已提交尾部。
+- ACL、channel 或 recipient 过滤不会让 `next_seq` 回退。
 
 ### 3.5 Subscribe
 
@@ -191,7 +195,7 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 
 `SubscribeResponse` 使用 `oneof result`：
 
-- `message`：正常推送的可见消息。
+- `message`：正常推送的可见 `EventMessage`。
 - `next_seq`：仅用于 `from_seq > max_seq` 场景，提示调用方下一次可使用的起点。
 
 每条订阅推送的 `message` 都包含写入时生成的 `ts_ms`。

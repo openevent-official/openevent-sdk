@@ -17,8 +17,8 @@ topology, or internal execution mechanisms.
 - Business requests carry `principal + token`, except for `AdminService`.
 - Clients only depend on `seq` as the message position. Any internal offset is
   not part of the public protocol.
-- Each committed message contains `ts_ms`, the Unix millisecond timestamp when
-  the server received the publish request.
+- Each committed log entry is returned as an `EventMessage`. It contains `ts_ms`,
+  the Unix millisecond timestamp when the server received the publish request.
 - `payload` is an opaque byte array. OpenEvent does not parse it or validate any
   business schema.
 - OpenEvent retains all committed history messages and channel metadata.
@@ -159,6 +159,9 @@ Request rules:
 
 - token matches `principal`.
 - `limit` must be in `1..1000`, otherwise `INVALID_ARGUMENT` is returned.
+- `channels` is an optional channel ID filter. When it is empty, Fetch scans all
+  channels visible to the caller. When it is non-empty, only messages from those
+  channel IDs are returned, after normal ACL filtering.
 - With `only_my_recipient=true`, only messages whose `recipients` include the
   current `principal` are returned.
 
@@ -166,18 +169,21 @@ Start semantics:
 
 | `from_seq` | Behavior |
 |------------|----------|
-| `0` | Return empty result and `next_seq=max_seq+1` |
-| `> max_seq` | Return empty result and `next_seq=max_seq+1` |
+| `0` | Return empty result, `next_seq=max_seq+1`, and `last_seq=max_seq` |
+| `> max_seq` | Return empty result, `next_seq=max_seq+1`, and `last_seq=max_seq` |
 | `1..max_seq` | Scan from this seq and return visible messages |
 
 Response semantics:
 
-- `messages` contains at most `limit` visible messages.
+- `messages` contains at most `limit` visible `EventMessage` values after ACL,
+  `channels`, and recipient filtering.
 - Every message contains its publish-time `ts_ms`.
 - `next_seq` is the suggested start point for the next fetch.
-- `has_more=true` means continuing from `next_seq` may reveal later global
-  messages.
-- ACL or recipient filtering never moves `next_seq` backward.
+- `last_seq` is the highest committed global seq observed by this Fetch response.
+- If `next_seq <= last_seq`, callers may continue scanning from `next_seq`.
+  If `next_seq > last_seq`, the response reached the committed tail visible to
+  this Fetch operation.
+- ACL, channel, or recipient filtering never moves `next_seq` backward.
 
 ### 3.5 Subscribe
 
@@ -204,7 +210,7 @@ Start semantics:
 
 `SubscribeResponse` uses `oneof result`:
 
-- `message`: a visible message.
+- `message`: a visible `EventMessage`.
 - `next_seq`: only used when `from_seq > max_seq`, indicating a usable next
   start point.
 
