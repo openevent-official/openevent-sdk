@@ -11,7 +11,7 @@
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.3.0-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.4.0-py3-none-any.whl
 ```
 
 开发本仓库时，可以直接生成 protobuf 代码并使用源码：
@@ -93,6 +93,36 @@ client.publish(
 `payload` 是不透明字节数组，SDK 不解析内容。你可以自行使用 JSON、MessagePack、
 自定义二进制协议或普通文本。
 
+SDK 自建的 gRPC channel 默认把单条收发消息上限设为 64 MiB，以容纳默认 16 MiB payload 和分页
+响应。调用方注入自定义 channel 时必须自行设置足够的 `grpc.max_send_message_length` 和
+`grpc.max_receive_message_length`。
+
+### 发布失败后的对账
+
+`Publish` 或 `PublishAutoSeq` 遇到连接中断、取消、`DEADLINE_EXCEEDED` 或部分
+`UNAVAILABLE` 时，服务端可能已经完成写入。不要直接重试，否则 `PublishAutoSeq` 可能产生重复
+消息，`Publish` 也可能因原 seq 已提交而返回 `ABORTED`。
+
+只有 `UNAUTHENTICATED`、`PERMISSION_DENIED`、`NOT_FOUND`、`INVALID_ARGUMENT`、
+`RESOURCE_EXHAUSTED`，以及仅适用于 `Publish` seq CAS 冲突的 `ABORTED`，保证本次发布没有提交。
+其他任何非 `OK` 返回或没有 gRPC status 都按结果不确定处理。保证未提交不等于可恢复；详细契约见
+[API_cn.md](API_cn.md) 的 2.7 节。
+
+推荐流程：
+
+1. 发布前记录 `get_status(...).max_seq`，并在 payload 的业务协议中加入唯一事件 ID。
+2. 结果不确定时先再次调用 GetStatus，记录 `reconcile_max_seq`；如果原发布已提交，该水位必须
+   包含它。
+3. 从此前的 `max_seq+1` 开始 Fetch，持续以 `next_seq` 翻页，直到扫描位置超过
+   `reconcile_max_seq`。Subscribe 可以帮助尽快发现匹配消息，但因为被过滤的 seq 不会返回进度，
+   不能单独证明消息不存在。
+4. `Publish` 检查指定 seq；`PublishAutoSeq` 在扫描区间内查找同一事件 ID。
+5. 找到时按成功处理并使用消息 seq；确认不存在后再决定是否重新发布。
+
+服务端对修改和非流式有状态读提供全局线性化顺序：写 RPC 成功返回后才发起的 GetStatus、Fetch
+或其他非流式读 RPC 必须看到该写的完整结果。Subscribe 不属于该顺序，不能用于替代 GetStatus
+和 Fetch 的确定水位对账。
+
 ## 拉取消息
 
 ```python
@@ -131,7 +161,8 @@ response = client.fetch(
 
 ## 订阅消息
 
-`subscribe` 返回 gRPC stream：
+`subscribe` 返回兼容 gRPC stream 的迭代器；它保留 `cancel()` 等 gRPC call 方法，同时执行下述
+SDK 序号检查：
 
 ```python
 for item in client.subscribe(principal, token, from_seq=0):
@@ -142,8 +173,12 @@ for item in client.subscribe(principal, token, from_seq=0):
         print("next seq:", item.next_seq)
 ```
 
-`from_seq=0` 表示从当前最新消息之后开始等待新消息。如果连接断开，客户端应记录已经处理到的
-`seq`，之后用下一条期望的 `seq` 重新订阅或拉取。
+`from_seq=0` 表示从当前最新位置之后开始等待新消息。如果连接断开，客户端应记录已经处理到的
+`seq`，之后从 `seq + 1` 重新订阅或拉取。
+
+高层 `OpenEventClient.subscribe` 迭代器会在同一条 stream 内按消息 `seq` 丢弃重复或回退的消息。
+跨连接仍需由调用方持久化最后处理的 `seq`，并从 `seq + 1` 恢复；需要原始 stream 时可以直接
+使用生成式 gRPC stub。
 
 ## 定向消息
 
@@ -172,13 +207,30 @@ from openevent.sdk import AdminClient
 admin = AdminClient("127.0.0.1:9528")
 
 binding = admin.add_token(target_principal=1001).binding
-print(binding.principal, binding.token)
+print("已创建 token，principal:", binding.principal)
 
-for item in admin.list_tokens().bindings:
-    print(item.principal, item.token)
+page_token = ""
+while True:
+    token_page = admin.list_tokens(page_token=page_token, limit=100)
+    print("本页 token binding 数量:", len(token_page.bindings))
+    if not token_page.next_page_token:
+        break
+    page_token = token_page.next_page_token
 
 admin.delete_token(binding.token)
+
+message_page = admin.list_messages(from_seq=0, limit=100)
+for message in message_page.messages:
+    print(message.seq, message.channel_id, message.payload)
+
 ```
+
+`binding.token`、ListTokens 返回的 token 和分页使用的 page token 都是敏感凭据。示例只在内存中
+使用这些值，不应把它们写入日志、trace、错误信息或普通控制台输出。
+
+`ListTokens` 使用不透明 `page_token` 分页，`next_page_token=""` 表示结束；token 可增删，因此
+跨页不构成强快照。`ListMessages` 是管理查询，不经过业务 Channel ACL 过滤；下一页使用
+`next_seq` 作为包含起点的游标。部署时必须保护管理端口。
 
 ## 错误处理
 
@@ -213,7 +265,7 @@ make clean
 
 `make init` 会把 Python protobuf 代码生成到
 [`src/openevent/sdk/proto/`](../src/openevent/sdk/proto/)。
-生成的 `openevent_pb2*.py` 不进 git，但会被构建进 wheel。
+生成的 `openevent_pb2*.py` 和 `admin_pb2*.py` 不进 git，但会被构建进 wheel。
 
 `make build` 使用 Hatchling 构建 wheel，构建依赖、测试依赖、缓存和临时文件放在 `build/`，
 最终产物放在 `dist/`。

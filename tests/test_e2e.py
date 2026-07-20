@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import os
 import time
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import grpc
 import pytest
 
 from openevent.sdk import AdminClient, OpenEventClient
-from openevent.sdk.proto import openevent_pb2
+from openevent.sdk.proto import admin_pb2, admin_pb2_grpc, openevent_pb2, openevent_pb2_grpc
 
 
 pytestmark = pytest.mark.skipif(
@@ -49,6 +51,77 @@ def _assert_rpc_code(exc_info: pytest.ExceptionInfo[grpc.RpcError], code: grpc.S
 
 def _messages_by_payload(messages: Iterable, payload: bytes):
     return [message for message in messages if message.payload == payload]
+
+
+def _list_all_tokens(admin: AdminClient, limit: int = 100):
+    bindings = []
+    page_token = ""
+    seen_page_tokens = set()
+    while True:
+        page = admin.list_tokens(page_token=page_token, limit=limit)
+        assert len(page.bindings) <= limit
+        bindings.extend(page.bindings)
+        if not page.next_page_token:
+            return bindings
+        assert page.next_page_token not in seen_page_tokens
+        seen_page_tokens.add(page.next_page_token)
+        page_token = page.next_page_token
+
+
+def _fetch_to_watermark(
+    client: OpenEventClient,
+    principal: int,
+    token: str,
+    from_seq: int,
+    last_seq: int,
+):
+    messages = []
+    next_seq = from_seq
+    while next_seq <= last_seq:
+        page = client.fetch(
+            principal=principal,
+            token=token,
+            from_seq=next_seq,
+            limit=1000,
+        )
+        messages.extend(message for message in page.messages if message.seq <= last_seq)
+        assert page.next_seq > next_seq
+        next_seq = page.next_seq
+    return messages
+
+
+class _CommitThenAbortEventService(openevent_pb2_grpc.EventServiceServicer):
+    def __init__(self, upstream_target: str):
+        self._channel = grpc.insecure_channel(upstream_target)
+        self._stub = openevent_pb2_grpc.EventServiceStub(self._channel)
+
+    def Publish(self, request, context):
+        self._stub.Publish(request)
+        context.abort(grpc.StatusCode.UNAVAILABLE, "test proxy dropped committed Publish response")
+
+    def PublishAutoSeq(self, request, context):
+        self._stub.PublishAutoSeq(request)
+        context.abort(grpc.StatusCode.UNAVAILABLE, "test proxy dropped committed PublishAutoSeq response")
+
+    def close(self) -> None:
+        self._channel.close()
+
+
+@contextmanager
+def _commit_then_abort_client() -> Iterator[OpenEventClient]:
+    service = _CommitThenAbortEventService(_event_target())
+    server = grpc.server(ThreadPoolExecutor(max_workers=2))
+    openevent_pb2_grpc.add_EventServiceServicer_to_server(service, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    assert port > 0
+    server.start()
+    proxy_client = OpenEventClient(f"127.0.0.1:{port}")
+    try:
+        yield proxy_client
+    finally:
+        proxy_client.channel.close()
+        server.stop(0).wait()
+        service.close()
 
 
 def test_publish_auto_seq_and_fetch_round_trip(admin: AdminClient, client: OpenEventClient) -> None:
@@ -144,6 +217,16 @@ def test_private_channel_acl_and_member_management(admin: AdminClient, client: O
             payload=b"outsider blocked",
         )
     _assert_rpc_code(exc_info, grpc.StatusCode.PERMISSION_DENIED)
+
+    outsider_fetch = client.fetch(
+        principal=outsider,
+        token=outsider_token,
+        from_seq=member_seq,
+        limit=10,
+        channels=[channel_id],
+    )
+    assert not _messages_by_payload(outsider_fetch.messages, b"member can write")
+    assert outsider_fetch.next_seq > member_seq
 
     client.remove_member(principal=owner, token=owner_token, channel_id=channel_id, target_principal=member)
     with pytest.raises(grpc.RpcError) as exc_info:
@@ -291,6 +374,24 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
     assert first.message.seq == history_seq
     assert first.message.payload == b"subscribe history"
 
+    future_stream = client.subscribe(principal=principal, token=token, from_seq=0)
+    executor = ThreadPoolExecutor(max_workers=1)
+    pending = executor.submit(next, future_stream)
+    try:
+        time.sleep(0.2)
+        future_seq = client.publish_auto_seq(
+            principal=principal,
+            token=token,
+            channel_id=channel_id,
+            payload=b"subscribe future",
+        ).seq
+        future = pending.result(timeout=5)
+        assert future.message.seq == future_seq
+        assert future.message.payload == b"subscribe future"
+    finally:
+        future_stream.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
     max_seq = client.get_status(principal=principal, token=token).max_seq
     boundary = list(client.subscribe(principal=principal, token=token, from_seq=max_seq + 10))
     assert len(boundary) == 1
@@ -300,12 +401,174 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
 def test_token_delete_changes_authentication(admin: AdminClient, client: OpenEventClient) -> None:
     principal = 1501
     token = _token(admin, principal)
+    pagination_tokens = {_token(admin, 1502), _token(admin, 1503)}
     client.get_status(principal=principal, token=token)
 
     admin.delete_token(target_token=token)
-    remaining = admin.list_tokens().bindings
+    remaining = _list_all_tokens(admin, limit=1)
 
     with pytest.raises(grpc.RpcError) as exc_info:
         client.get_status(principal=principal, token=token)
     _assert_rpc_code(exc_info, grpc.StatusCode.UNAUTHENTICATED)
-    assert token not in {binding.token for binding in remaining}
+    remaining_tokens = {binding.token for binding in remaining}
+    assert token not in remaining_tokens
+    assert pagination_tokens.issubset(remaining_tokens)
+
+    for pagination_token in pagination_tokens:
+        admin.delete_token(target_token=pagination_token)
+
+
+def test_admin_lists_all_messages_and_ports_are_isolated(
+    admin: AdminClient, client: OpenEventClient
+) -> None:
+    principal = 1601
+    member = 1602
+    outsider = 1603
+    token = _token(admin, principal)
+    outsider_token = _token(admin, outsider)
+    public_channel_id = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-admin-public"),
+        visibility=openevent_pb2.VISIBILITY_PUBLIC,
+    ).channel.channel_id
+    private_channel_id = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-admin-private"),
+        visibility=openevent_pb2.VISIBILITY_PRIVATE,
+        members=[member],
+    ).channel.channel_id
+    public_payload = _unique("admin-public").encode()
+    private_payload = _unique("admin-private").encode()
+    recipient_payload = _unique("admin-recipient").encode()
+    public_seq = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=public_channel_id,
+        payload=public_payload,
+    ).seq
+    private_seq = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=private_channel_id,
+        payload=private_payload,
+    ).seq
+    recipient_seq = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=private_channel_id,
+        recipients=[member],
+        payload=recipient_payload,
+    ).seq
+
+    first_page = admin.list_messages(from_seq=0, limit=1)
+    boundary = first_page.last_seq
+    assert boundary >= max(public_seq, private_seq, recipient_seq)
+    appended_payload = _unique("admin-after-boundary").encode()
+    appended_seq = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=public_channel_id,
+        payload=appended_payload,
+    ).seq
+    assert appended_seq > boundary
+
+    collected = [message for message in first_page.messages if message.seq <= boundary]
+    next_seq = first_page.next_seq
+    seen_cursors = {next_seq}
+    while next_seq <= boundary:
+        page = admin.list_messages(from_seq=next_seq, limit=1)
+        assert len(page.messages) <= 1
+        collected.extend(message for message in page.messages if message.seq <= boundary)
+        assert page.next_seq > next_seq
+        next_seq = page.next_seq
+        if next_seq <= boundary:
+            assert next_seq not in seen_cursors
+            seen_cursors.add(next_seq)
+
+    collected_seqs = [message.seq for message in collected]
+    assert collected_seqs == sorted(collected_seqs)
+    assert len(collected_seqs) == len(set(collected_seqs))
+    collected_payloads = {message.payload for message in collected}
+    assert {public_payload, private_payload, recipient_payload}.issubset(collected_payloads)
+    assert appended_payload not in collected_payloads
+
+    outsider_fetch = client.fetch(
+        principal=outsider,
+        token=outsider_token,
+        from_seq=private_seq,
+        limit=1000,
+        channels=[private_channel_id],
+    )
+    assert private_payload not in {message.payload for message in outsider_fetch.messages}
+    assert recipient_payload not in {message.payload for message in outsider_fetch.messages}
+
+    with pytest.raises(grpc.RpcError) as exc_info:
+        admin.list_messages(from_seq=0, limit=0)
+    _assert_rpc_code(exc_info, grpc.StatusCode.INVALID_ARGUMENT)
+    with pytest.raises(grpc.RpcError) as exc_info:
+        admin.list_messages(from_seq=0, limit=1001)
+    _assert_rpc_code(exc_info, grpc.StatusCode.INVALID_ARGUMENT)
+
+    business_admin_stub = admin_pb2_grpc.AdminServiceStub(grpc.insecure_channel(_event_target()))
+    with pytest.raises(grpc.RpcError) as exc_info:
+        business_admin_stub.ListMessages(admin_pb2.ListMessagesRequest(from_seq=0, limit=1))
+    _assert_rpc_code(exc_info, grpc.StatusCode.UNIMPLEMENTED)
+
+    admin_event_stub = openevent_pb2_grpc.EventServiceStub(grpc.insecure_channel(_admin_target()))
+    with pytest.raises(grpc.RpcError) as exc_info:
+        admin_event_stub.GetStatus(openevent_pb2.GetStatusRequest(principal=principal, token=token))
+    _assert_rpc_code(exc_info, grpc.StatusCode.UNIMPLEMENTED)
+
+
+def test_uncertain_publish_result_is_reconciled_without_direct_retry(
+    admin: AdminClient, client: OpenEventClient
+) -> None:
+    principal = 1701
+    token = _token(admin, principal)
+    channel_id = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-reconcile"),
+        visibility=openevent_pb2.VISIBILITY_PUBLIC,
+    ).channel.channel_id
+
+    auto_before = client.get_status(principal=principal, token=token).max_seq
+    auto_payload = _unique("uncertain-auto").encode()
+    with _commit_then_abort_client() as proxy:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            proxy.publish_auto_seq(
+                principal=principal,
+                token=token,
+                channel_id=channel_id,
+                payload=auto_payload,
+            )
+        _assert_rpc_code(exc_info, grpc.StatusCode.UNAVAILABLE)
+    auto_watermark = client.get_status(principal=principal, token=token).max_seq
+    auto_matches = _messages_by_payload(
+        _fetch_to_watermark(client, principal, token, auto_before + 1, auto_watermark),
+        auto_payload,
+    )
+    assert len(auto_matches) == 1
+
+    cas_before = client.get_status(principal=principal, token=token).max_seq
+    cas_seq = cas_before + 1
+    cas_payload = _unique("uncertain-cas").encode()
+    with _commit_then_abort_client() as proxy:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            proxy.publish(
+                principal=principal,
+                token=token,
+                channel_id=channel_id,
+                seq=cas_seq,
+                payload=cas_payload,
+            )
+        _assert_rpc_code(exc_info, grpc.StatusCode.UNAVAILABLE)
+    cas_watermark = client.get_status(principal=principal, token=token).max_seq
+    cas_matches = _messages_by_payload(
+        _fetch_to_watermark(client, principal, token, cas_seq, cas_watermark),
+        cas_payload,
+    )
+    assert len(cas_matches) == 1
+    assert cas_matches[0].seq == cas_seq

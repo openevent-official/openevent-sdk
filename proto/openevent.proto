@@ -6,7 +6,7 @@ option java_package = "io.openevent";
 option go_package = "openevent/proto;openevent";
 
 // ============================================================================
-// 公共枚举
+// Public enums
 // ============================================================================
 
 enum Visibility {
@@ -22,15 +22,15 @@ enum ChannelFilter {
 }
 
 // ============================================================================
-// 公共消息类型
+// Public message types
 // ============================================================================
 
 message EventMessage {
-    uint64 seq = 1;               // 全局严格连续编号，从 1 开始
-    uint64 ts_ms = 2;             // 服务端收到写入请求的 Unix 毫秒时间戳
+    uint64 seq = 1;               // Global message sequence; monotonically increasing; clients must not rely on adjacency
+    uint64 ts_ms = 2;             // Unix timestamp in milliseconds when the server receives the publish request
     uint64 channel_id = 3;
-    uint64 principal = 4;         // 发送者
-    repeated uint64 recipients = 5;  // 接收方 principal 列表
+    uint64 principal = 4;         // Sender principal
+    repeated uint64 recipients = 5;  // Recipient principal list
     bytes payload = 6;
 }
 
@@ -38,14 +38,14 @@ message ChannelInfo {
     uint64 channel_id = 1;
     string name = 2;
     Visibility visibility = 3;
-    string protocol = 4;          // 协议约定标签，服务端不校验
+    string protocol = 4;          // Protocol label; the server does not validate it
     string description = 5;
-    optional uint64 creator = 6;  // 创建者 principal；系统频道不设置
-    repeated uint64 members = 7;  // 成员 principal 列表；系统频道为空
+    optional uint64 creator = 6;  // Creator principal; unset for the system Channel
+    repeated uint64 members = 7;  // Member principal list; empty for the system Channel
 }
 
 // ============================================================================
-// EventService — 消息发布、拉取、订阅
+// EventService - message publishing, fetching, and subscription
 // ============================================================================
 
 service EventService {
@@ -62,16 +62,16 @@ message GetStatusRequest {
 }
 
 message GetStatusResponse {
-    uint64 min_seq = 1;           // 当前最小可用 seq；全量保留模式下有消息时固定为 1
-    uint64 max_seq = 2;           // 当前最大 seq，无消息时为 0
+    uint64 min_seq = 1;           // Lowest available message sequence; 0 when the message sequence is empty
+    uint64 max_seq = 2;           // Highest committed message sequence; 0 when the message sequence is empty
 }
 
 message PublishRequest {
     uint64 principal = 1;
     string token = 2;
     uint64 channel_id = 3;
-    uint64 seq = 4;               // 期望的 seq，须严格等于当前 max_seq + 1
-    repeated uint64 recipients = 6;  // 接收方 principal 列表
+    uint64 seq = 4;               // Expected message sequence; must equal the current max_seq + 1
+    repeated uint64 recipients = 6;  // Recipient principal list
     bytes payload = 5;
 }
 
@@ -82,21 +82,21 @@ message PublishAutoSeqRequest {
     uint64 principal = 1;
     string token = 2;
     uint64 channel_id = 3;
-    repeated uint64 recipients = 5;  // 接收方 principal 列表
+    repeated uint64 recipients = 5;  // Recipient principal list
     bytes payload = 4;
 }
 
 message PublishAutoSeqResponse {
-    uint64 seq = 1;               // 服务端分配并确认写入的 seq
+    uint64 seq = 1;               // Message sequence allocated and committed by the server
 }
 
 message FetchRequest {
     uint64 principal = 1;
     string token = 2;
-    uint64 from_seq = 3;          // 起始 seq（含），0 = 从当前 max_seq 之后开始
-    uint32 limit = 4;             // 最大返回可见消息条数，必填，范围 1~1000
-    bool only_my_recipient = 5;   // 为 true 时仅返回 recipients 包含 principal 的消息
-    repeated uint64 channels = 6;  // 仅返回指定 channel_id 的消息；为空表示不过滤 channel
+    uint64 from_seq = 3;          // Inclusive starting sequence; 0 returns an empty result immediately
+    uint32 limit = 4;             // Maximum visible messages to return; required; range 1..1000
+    bool only_my_recipient = 5;   // If true, return only messages whose recipients contain principal
+    repeated uint64 channels = 6;  // Return only messages from these channel IDs; empty disables Channel filtering
 }
 
 message FetchResponse {
@@ -108,19 +108,19 @@ message FetchResponse {
 message SubscribeRequest {
     uint64 principal = 1;
     string token = 2;
-    uint64 from_seq = 3;          // 起始 seq，0 = 从当前 max_seq 之后开始
-    bool only_my_recipient = 4;   // 为 true 时仅推送 recipients 包含 principal 的消息
+    uint64 from_seq = 3;          // Starting sequence; 0 starts after the current max_seq
+    bool only_my_recipient = 4;   // If true, push only messages whose recipients contain principal
 }
 
 message SubscribeResponse {
     oneof result {
-        EventMessage message = 1; // 正常订阅推送的消息
-        uint64 next_seq = 2;      // from_seq > max_seq 时返回建议下一次起点并结束 stream
+        EventMessage message = 1; // Message delivered by the subscription
+        uint64 next_seq = 2;      // Suggested next start when from_seq > max_seq; the stream then ends
     }
 }
 
 // ============================================================================
-// ChannelService — 通道管理
+// ChannelService - Channel management
 // ============================================================================
 
 service ChannelService {
@@ -131,21 +131,14 @@ service ChannelService {
     rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 }
 
-service AdminService {
-    // AdminService 运行在独立管理端口，当前不做额外鉴权。
-    rpc AddToken(AddTokenRequest) returns (AddTokenResponse);
-    rpc DeleteToken(DeleteTokenRequest) returns (DeleteTokenResponse);
-    rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
-}
-
 message CreateChannelRequest {
     uint64 principal = 1;
     string token = 2;
     string name = 3;
-    Visibility visibility = 4;    // 未设置时 proto3 默认 VISIBILITY_PUBLIC
-    string protocol = 5;          // 协议约定标签（可选）
+    Visibility visibility = 4;    // Defaults to VISIBILITY_PUBLIC when unset under proto3
+    string protocol = 5;          // Optional protocol label
     string description = 6;
-    repeated uint64 members = 7;  // 成员 principal 列表
+    repeated uint64 members = 7;  // Member principal list
 }
 
 message CreateChannelResponse {
@@ -165,7 +158,7 @@ message GetChannelResponse {
 message ListChannelsRequest {
     uint64 principal = 1;
     string token = 2;
-    ChannelFilter filter = 3;     // 未设置时 proto3 默认 CHANNEL_FILTER_ALL
+    ChannelFilter filter = 3;     // Defaults to CHANNEL_FILTER_ALL when unset under proto3
 }
 
 message ListChannelsResponse {
@@ -173,44 +166,19 @@ message ListChannelsResponse {
 }
 
 message AddMemberRequest {
-    uint64 principal = 1;         // 操作者（须为创建者）
+    uint64 principal = 1;         // Operator; must be the creator
     string token = 2;
     uint64 channel_id = 3;
-    uint64 target_principal = 4;  // 被添加的成员
+    uint64 target_principal = 4;  // Principal to add as a member
 }
 
 message AddMemberResponse {}
 
 message RemoveMemberRequest {
-    uint64 principal = 1;         // 操作者（须为创建者）
+    uint64 principal = 1;         // Operator; must be the creator
     string token = 2;
     uint64 channel_id = 3;
-    uint64 target_principal = 4;  // 被移除的成员
+    uint64 target_principal = 4;  // Principal to remove from the members
 }
 
 message RemoveMemberResponse {}
-
-message TokenBinding {
-    string token = 1;
-    uint64 principal = 2;
-}
-
-message AddTokenRequest {
-    uint64 target_principal = 1;
-}
-
-message AddTokenResponse {
-    TokenBinding binding = 1;
-}
-
-message DeleteTokenRequest {
-    string target_token = 1;
-}
-
-message DeleteTokenResponse {}
-
-message ListTokensRequest {}
-
-message ListTokensResponse {
-    repeated TokenBinding bindings = 1;
-}

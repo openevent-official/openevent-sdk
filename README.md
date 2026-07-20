@@ -6,13 +6,16 @@
 contract documentation, and Python SDK.
 
 The Python SDK is a lightweight wrapper around generated gRPC stubs. It does not
-add application-level business semantics.
+add application-level business semantics. Its high-level subscription iterator
+only suppresses repeated or backward message `seq` values within one stream; the
+generated stub remains available for raw stream access.
 
 ## Directory Layout
 
 ```text
 openevent-sdk/
 ├── proto/
+│   ├── admin.proto
 │   └── openevent.proto
 ├── docs/
 │   └── API.md
@@ -24,14 +27,15 @@ openevent-sdk/
 │   └── openevent/
 │       └── sdk/
 │           ├── __init__.py
+│           ├── admin_client.py
 │           ├── client.py
 │           └── proto/
 │               └── __init__.py
 └── pyproject.toml
 ```
 
-`src/openevent/sdk/proto/openevent_pb2*.py` is generated from
-`proto/openevent.proto` and is not tracked by Git. Generate it before local
+`src/openevent/sdk/proto/*_pb2*.py` is generated from `proto/openevent.proto`
+and `proto/admin.proto` and is not tracked by Git. Generate it before local
 debugging, builds, or tests.
 
 ## Build and Test
@@ -55,7 +59,7 @@ make build
 The wheel is written to:
 
 ```text
-dist/openevent_sdk-0.3.0-py3-none-any.whl
+dist/openevent_sdk-0.4.0-py3-none-any.whl
 ```
 
 Build and install the generated wheel:
@@ -85,7 +89,7 @@ Run end-to-end tests against a real OpenEvent server:
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-End-to-end tests use the `openevent-sdk>=0.3.0` package already installed in
+End-to-end tests use the `openevent-sdk>=0.4.0` package already installed in
 the current Python environment. They do not install this repository into a
 temporary dependency directory or generate SDK protobuf files.
 
@@ -97,10 +101,12 @@ make clean
 
 ## Documentation
 
-- [Protocol definition](proto/openevent.proto)
+- [Business protocol definition](proto/openevent.proto)
+- [Admin protocol definition](proto/admin.proto)
 - [Usage guide](docs/USAGE.md)
 - [API contract](docs/API.md)
-- [Python SDK entry point](src/openevent/sdk/client.py)
+- [Business client](src/openevent/sdk/client.py)
+- [Admin client](src/openevent/sdk/admin_client.py)
 
 `docs/API.md` only documents public fields, RPC behavior, error semantics, and
 compatibility guidance. It does not describe server implementation details.

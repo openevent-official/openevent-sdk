@@ -44,7 +44,7 @@ import sys
 required = {
     "grpc": "grpcio",
     "pytest": "pytest",
-    "openevent.sdk": "openevent-sdk>=0.3.0",
+    "openevent.sdk": "openevent-sdk>=0.4.0",
 }
 missing = [requirement for module, requirement in required.items() if importlib.util.find_spec(module) is None]
 if missing:
@@ -53,11 +53,19 @@ if missing:
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.3.0", file=sys.stderr)
+    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.4.0", file=sys.stderr)
     sys.exit(2)
 parts = tuple(int(part) for part in version.split(".")[:3] if part.isdigit())
-if parts < (0, 3, 0):
-    print(f"openevent-sdk>=0.3.0 is required for e2e tests, found {version}", file=sys.stderr)
+if parts < (0, 4, 0):
+    print(f"openevent-sdk>=0.4.0 is required for e2e tests, found {version}", file=sys.stderr)
+    sys.exit(2)
+
+from openevent.sdk import AdminClient
+from openevent.sdk.proto import admin_pb2
+
+service = admin_pb2.DESCRIPTOR.services_by_name.get("AdminService")
+if service is None or "ListMessages" not in service.methods_by_name or not hasattr(AdminClient, "list_messages"):
+    print("installed openevent-sdk does not provide AdminService.ListMessages", file=sys.stderr)
     sys.exit(2)
 PY
 
@@ -69,17 +77,10 @@ admin:
   listen_addr: "$ADMIN_ADDR"
 
 storage:
-  metadata_path: "$SERVER_DIR/meta"
-
-store:
-  rocksdb:
-    path: "$SERVER_DIR/messages"
+  path: "$SERVER_DIR/data"
 
 limits:
   max_payload_bytes: 16777216
-
-log:
-  level: "info"
 YAML
 
 "$SERVER_BIN" "$CONFIG_PATH" >"$LOG_PATH" 2>&1 &
@@ -100,20 +101,26 @@ import time
 
 import grpc
 
-from openevent.sdk import AdminClient
+from openevent.sdk import AdminClient, OpenEventClient
 
-target = os.environ["OPENEVENT_E2E_ADMIN_TARGET"]
+admin_target = os.environ["OPENEVENT_E2E_ADMIN_TARGET"]
+event_target = os.environ["OPENEVENT_E2E_TARGET"]
 deadline = time.time() + 10
 last_error = None
 while time.time() < deadline:
     try:
-        AdminClient(target).list_tokens()
+        AdminClient(admin_target).list_tokens()
+        try:
+            OpenEventClient(event_target).get_status(principal=0, token="readiness-invalid-token")
+        except grpc.RpcError as exc:
+            if exc.code() != grpc.StatusCode.UNAUTHENTICATED:
+                raise
         break
     except grpc.RpcError as exc:
         last_error = exc
         time.sleep(0.1)
 else:
-    print(f"OpenEvent admin endpoint did not become ready: {last_error}", file=sys.stderr)
+    print(f"OpenEvent endpoints did not become ready: {last_error}", file=sys.stderr)
     sys.exit(1)
 PY
 

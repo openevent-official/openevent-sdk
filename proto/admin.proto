@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package openevent;
+
+option java_package = "io.openevent";
+option go_package = "openevent/proto;openevent";
+
+import "openevent.proto";
+
+// ============================================================================
+// AdminService - token management and administrative message queries
+// ============================================================================
+
+// AdminService runs on a separate management port and currently performs no additional authentication.
+service AdminService {
+    rpc AddToken(AddTokenRequest) returns (AddTokenResponse);
+    rpc DeleteToken(DeleteTokenRequest) returns (DeleteTokenResponse);
+    rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+    rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+}
+
+message TokenBinding {
+    string token = 1;
+    uint64 principal = 2;
+}
+
+message AddTokenRequest {
+    uint64 target_principal = 1;
+}
+
+message AddTokenResponse {
+    TokenBinding binding = 1;
+}
+
+message DeleteTokenRequest {
+    string target_token = 1;
+}
+
+message DeleteTokenResponse {}
+
+message ListTokensRequest {
+    string page_token = 1;         // Opaque pagination cursor; empty means the first page
+    uint32 limit = 2;              // Maximum tokens to return; required; range 1..1000
+}
+
+message ListTokensResponse {
+    repeated TokenBinding bindings = 1;
+    string next_page_token = 2;    // Opaque cursor for the next page; empty means the end
+}
+
+message ListMessagesRequest {
+    uint64 from_seq = 1;          // Inclusive starting message sequence; 0 starts from 1
+    uint32 limit = 2;             // Maximum messages to return; required; range 1..1000
+}
+
+message ListMessagesResponse {
+    repeated EventMessage messages = 1;
+    uint64 next_seq = 2;          // Suggested starting sequence for the next scan
+    uint64 last_seq = 3;          // Highest committed message sequence when the query started
+}

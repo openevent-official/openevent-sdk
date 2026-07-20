@@ -11,9 +11,38 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 
+_DEFAULT_MAX_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024
+_DEFAULT_CHANNEL_OPTIONS = (
+    ("grpc.max_send_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
+    ("grpc.max_receive_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
+)
+
+
+class _DeduplicatingSubscribeStream:
+    def __init__(self, stream):
+        self._stream = stream
+        self._last_seq = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            item = next(self._stream)
+            if item.HasField("message"):
+                seq = item.message.seq
+                if self._last_seq is not None and seq <= self._last_seq:
+                    continue
+                self._last_seq = seq
+            return item
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 class OpenEventClient:
     def __init__(self, target: str, channel: Optional[grpc.Channel] = None):
-        self.channel = channel or grpc.insecure_channel(target)
+        self.channel = channel or grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
         self.event_stub = openevent_pb2_grpc.EventServiceStub(self.channel)
         self.channel_stub = openevent_pb2_grpc.ChannelServiceStub(self.channel)
 
@@ -85,7 +114,7 @@ class OpenEventClient:
         from_seq: int = 0,
         only_my_recipient: bool = False,
     ):
-        return self.event_stub.Subscribe(
+        stream = self.event_stub.Subscribe(
             openevent_pb2.SubscribeRequest(
                 principal=principal,
                 token=token,
@@ -93,6 +122,7 @@ class OpenEventClient:
                 only_my_recipient=only_my_recipient,
             )
         )
+        return _DeduplicatingSubscribeStream(stream)
 
     def create_channel(
         self,
@@ -150,18 +180,3 @@ class OpenEventClient:
                 target_principal=target_principal,
             )
         )
-
-
-class AdminClient:
-    def __init__(self, target: str, channel: Optional[grpc.Channel] = None):
-        self.channel = channel or grpc.insecure_channel(target)
-        self.stub = openevent_pb2_grpc.AdminServiceStub(self.channel)
-
-    def add_token(self, target_principal: int):
-        return self.stub.AddToken(openevent_pb2.AddTokenRequest(target_principal=target_principal))
-
-    def delete_token(self, target_token: str):
-        return self.stub.DeleteToken(openevent_pb2.DeleteTokenRequest(target_token=target_token))
-
-    def list_tokens(self):
-        return self.stub.ListTokens(openevent_pb2.ListTokensRequest())

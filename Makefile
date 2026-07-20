@@ -42,3 +42,4 @@ e2e:
 clean:
 	rm -rf build dist
 	rm -f src/openevent/sdk/proto/openevent_pb2.py src/openevent/sdk/proto/openevent_pb2_grpc.py
+	rm -f src/openevent/sdk/proto/admin_pb2.py src/openevent/sdk/proto/admin_pb2_grpc.py
