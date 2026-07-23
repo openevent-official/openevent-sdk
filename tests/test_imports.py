@@ -35,25 +35,46 @@ def test_public_imports_and_constants() -> None:
     captured = []
 
     class Stub:
-        def ListTokens(self, request):
-            captured.append(request)
+        def ListTokens(self, request, timeout=None):
+            captured.append((request, timeout))
             return admin_pb2.ListTokensResponse(next_page_token="server-next")
 
-        def ListMessages(self, request):
-            captured.append(request)
+        def ListMessages(self, request, timeout=None):
+            captured.append((request, timeout))
             return admin_pb2.ListMessagesResponse(next_seq=11, last_seq=10)
 
     admin_client = AdminClient.__new__(AdminClient)
     admin_client.stub = Stub()
+    admin_client.timeout = 30.0
     listed = admin_client.list_tokens(page_token="server-cursor", limit=7)
-    assert captured[0].page_token == "server-cursor"
-    assert captured[0].limit == 7
+    assert captured[0][0].page_token == "server-cursor"
+    assert captured[0][0].limit == 7
+    assert captured[0][1] == 30.0
     assert listed.next_page_token == "server-next"
 
     messages = admin_client.list_messages(from_seq=3, limit=8)
-    assert captured[1].from_seq == 3
-    assert captured[1].limit == 8
+    assert captured[1][0].from_seq == 3
+    assert captured[1][0].limit == 8
+    assert captured[1][1] == 30.0
     assert messages.next_seq == 11
+
+
+def test_client_timeout_is_forwarded_to_unary_rpc() -> None:
+    class Stub:
+        def __init__(self):
+            self.timeouts = []
+
+        def GetStatus(self, request, timeout=None):
+            self.timeouts.append(timeout)
+
+    client = OpenEventClient.__new__(OpenEventClient)
+    stub = Stub()
+    client.event_stub = stub
+    client.timeout = 1.25
+    client.get_status(1, "token")
+    client.timeout = None
+    client.get_status(1, "token")
+    assert stub.timeouts == [1.25, None]
 
 
 def test_subscribe_filters_duplicate_and_backward_sequences() -> None:

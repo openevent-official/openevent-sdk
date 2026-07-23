@@ -12,6 +12,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 _DEFAULT_MAX_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024
+_DEFAULT_RPC_TIMEOUT_SECONDS = 30.0
 _DEFAULT_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
     ("grpc.max_receive_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
@@ -41,13 +42,22 @@ class _DeduplicatingSubscribeStream:
 
 
 class OpenEventClient:
-    def __init__(self, target: str, channel: Optional[grpc.Channel] = None):
+    def __init__(
+        self,
+        target: str,
+        channel: Optional[grpc.Channel] = None,
+        timeout: Optional[float] = _DEFAULT_RPC_TIMEOUT_SECONDS,
+    ):
         self.channel = channel or grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
+        self.timeout = timeout
         self.event_stub = openevent_pb2_grpc.EventServiceStub(self.channel)
         self.channel_stub = openevent_pb2_grpc.ChannelServiceStub(self.channel)
 
     def get_status(self, principal: int, token: str):
-        return self.event_stub.GetStatus(openevent_pb2.GetStatusRequest(principal=principal, token=token))
+        return self.event_stub.GetStatus(
+            openevent_pb2.GetStatusRequest(principal=principal, token=token),
+            timeout=self.timeout,
+        )
 
     def publish(
         self,
@@ -66,7 +76,8 @@ class OpenEventClient:
                 seq=seq,
                 recipients=list(recipients),
                 payload=payload,
-            )
+            ),
+            timeout=self.timeout,
         )
 
     def publish_auto_seq(
@@ -84,7 +95,8 @@ class OpenEventClient:
                 channel_id=channel_id,
                 recipients=list(recipients),
                 payload=payload,
-            )
+            ),
+            timeout=self.timeout,
         )
 
     def fetch(
@@ -104,7 +116,8 @@ class OpenEventClient:
                 limit=limit,
                 channels=list(channels),
                 only_my_recipient=only_my_recipient,
-            )
+            ),
+            timeout=self.timeout,
         )
 
     def subscribe(
@@ -143,12 +156,14 @@ class OpenEventClient:
                 protocol=protocol,
                 description=description,
                 members=list(members),
-            )
+            ),
+            timeout=self.timeout,
         )
 
     def get_channel(self, principal: int, token: str, channel_id: int):
         return self.channel_stub.GetChannel(
-            openevent_pb2.GetChannelRequest(principal=principal, token=token, channel_id=channel_id)
+            openevent_pb2.GetChannelRequest(principal=principal, token=token, channel_id=channel_id),
+            timeout=self.timeout,
         )
 
     def list_channels(
@@ -158,7 +173,8 @@ class OpenEventClient:
         filter: int = openevent_pb2.CHANNEL_FILTER_ALL,
     ):
         return self.channel_stub.ListChannels(
-            openevent_pb2.ListChannelsRequest(principal=principal, token=token, filter=filter)
+            openevent_pb2.ListChannelsRequest(principal=principal, token=token, filter=filter),
+            timeout=self.timeout,
         )
 
     def add_member(self, principal: int, token: str, channel_id: int, target_principal: int):
@@ -168,7 +184,8 @@ class OpenEventClient:
                 token=token,
                 channel_id=channel_id,
                 target_principal=target_principal,
-            )
+            ),
+            timeout=self.timeout,
         )
 
     def remove_member(self, principal: int, token: str, channel_id: int, target_principal: int):
@@ -178,5 +195,6 @@ class OpenEventClient:
                 token=token,
                 channel_id=channel_id,
                 target_principal=target_principal,
-            )
+            ),
+            timeout=self.timeout,
         )

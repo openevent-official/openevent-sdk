@@ -35,6 +35,10 @@ token = "user-token"
 `target` 是 gRPC 服务地址。默认使用 `grpc.insecure_channel`；如果你的部署需要 TLS
 或自定义 channel，可以创建 `grpc.Channel` 后传给 `OpenEventClient(target, channel=...)`。
 
+`OpenEventClient` 和 `AdminClient` 的构造函数都接受可选 `timeout`，默认值为 30 秒。该值作用于
+所有非流式 RPC；构造时传入 `None` 可关闭这些 deadline。`subscribe` 是长期流，不使用客户端
+timeout。
+
 ## 创建 Channel
 
 ```python

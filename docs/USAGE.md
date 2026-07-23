@@ -37,6 +37,11 @@ token = "user-token"
 `grpc.insecure_channel`. If your deployment requires TLS or a custom channel,
 create a `grpc.Channel` and pass it with `OpenEventClient(target, channel=...)`.
 
+`OpenEventClient` and `AdminClient` accept an optional constructor `timeout`
+with a 30-second default. The value is used by every non-streaming RPC; pass
+`None` at construction to disable those deadlines. `subscribe` is a long-lived
+stream and does not use the client timeout.
+
 ## Create a Channel
 
 ```python
