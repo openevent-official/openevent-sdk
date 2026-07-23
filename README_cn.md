@@ -54,7 +54,7 @@ make build
 构建完成后，wheel 位于：
 
 ```text
-dist/openevent_sdk-0.4.0-py3-none-any.whl
+dist/openevent_sdk-0.4.1-py3-none-any.whl
 ```
 
 构建并安装生成的 wheel：
@@ -82,7 +82,7 @@ make test
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-端到端测试使用当前 Python 环境中已经安装好的 `openevent-sdk>=0.4.0` 包；不会把
+端到端测试使用当前 Python 环境中已经安装好的 `openevent-sdk>=0.4.1` 包；不会把
 本仓库安装到临时依赖目录，也不会在 e2e 脚本里生成 SDK protobuf 文件。
 
 清理构建产物和临时文件：

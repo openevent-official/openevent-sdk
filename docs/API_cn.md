@@ -2,7 +2,7 @@
 
 [English version](API.md)
 
-> 版本: 0.4.0
+> 版本: 0.4.1
 > 日期: 2026-07-17
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议

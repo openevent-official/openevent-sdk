@@ -12,7 +12,7 @@ Build a wheel from this repository:
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.0-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.4.1-py3-none-any.whl
 ```
 
 For local development, generate protobuf code and use the source tree directly:

@@ -2,7 +2,7 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.4.0
+> Version: 0.4.1
 > Date: 2026-07-17
 
 This document defines the public behavior of the business protocol
