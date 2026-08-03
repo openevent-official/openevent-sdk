@@ -11,7 +11,7 @@
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.1-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.4.2-py3-none-any.whl
 ```
 
 开发本仓库时，可以直接生成 protobuf 代码并使用源码：
@@ -110,7 +110,7 @@ SDK 自建的 gRPC channel 默认把单条收发消息上限设为 64 MiB，以�
 只有 `UNAUTHENTICATED`、`PERMISSION_DENIED`、`NOT_FOUND`、`INVALID_ARGUMENT`、
 `RESOURCE_EXHAUSTED`，以及仅适用于 `Publish` seq CAS 冲突的 `ABORTED`，保证本次发布没有提交。
 其他任何非 `OK` 返回或没有 gRPC status 都按结果不确定处理。保证未提交不等于可恢复；详细契约见
-[API_cn.md](API_cn.md) 的 2.7 节。
+[API_cn.md](API_cn.md) 的 2.8 节。
 
 推荐流程：
 
@@ -126,6 +126,71 @@ SDK 自建的 gRPC channel 默认把单条收发消息上限设为 64 MiB，以�
 服务端对修改和非流式有状态读提供全局线性化顺序：写 RPC 成功返回后才发起的 GetStatus、Fetch
 或其他非流式读 RPC 必须看到该写的完整结果。Subscribe 不属于该顺序，不能用于替代 GetStatus
 和 Fetch 的确定水位对账。
+
+## 写入和引用对象
+
+对象存储和消息 `object_keys` 通过生成式 stub 使用。高层 client 有意保持为小型封装，不额外增加
+对象方法或 ObjectKey 参数。
+
+```python
+from openevent.sdk.proto import openevent_pb2, openevent_pb2_grpc
+
+objects = openevent_pb2_grpc.ObjectStorageServiceStub(client.channel)
+events = openevent_pb2_grpc.EventServiceStub(client.channel)
+
+written = objects.WriteObject(
+    openevent_pb2.WriteObjectRequest(
+        principal=principal,
+        token=token,
+        name="report.json",
+        type="application/json",
+        description="Agent output",
+        data=b'{"result":"ok"}',
+    ),
+    timeout=client.timeout,
+)
+key = openevent_pb2.ObjectKey(
+    object_id=written.object_id,
+    object_token=written.object_token,
+)
+
+published = events.PublishAutoSeq(
+    openevent_pb2.PublishAutoSeqRequest(
+        principal=principal,
+        token=token,
+        channel_id=channel_id,
+        payload=b"report ready",
+        object_keys=[key],
+    ),
+    timeout=client.timeout,
+)
+```
+
+使用 ObjectKey 读取 metadata 和字节范围。对象读取不携带 principal token，因为 ObjectKey 本身
+就是授权：
+
+```python
+metadata = objects.GetObjectMetadata(
+    openevent_pb2.GetObjectMetadataRequest(
+        object_id=key.object_id,
+        object_token=key.object_token,
+    ),
+    timeout=client.timeout,
+)
+chunk = objects.ReadObject(
+    openevent_pb2.ReadObjectRequest(
+        object_id=key.object_id,
+        object_token=key.object_token,
+        offset=0,
+        nbytes=metadata.nbytes,
+    ),
+    timeout=client.timeout,
+)
+```
+
+对象不可变、不能为空且最大 4 MiB。ObjectKey 是永久、可转交的 bearer credential；把它附加到
+消息会向所有能读取该消息的调用方披露 capability，包括管理端读取者。禁止记录对象 token。
+精确限制、范围规则、错误和 WriteObject 结果不确定语义见 [API_cn.md](API_cn.md) 的 2.6 和 4 节。
 
 ## 拉取消息
 

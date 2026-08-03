@@ -25,6 +25,11 @@ enum ChannelFilter {
 // Public message types
 // ============================================================================
 
+message ObjectKey {
+    uint64 object_id = 1;
+    string object_token = 2;      // Opaque credential used to authorize access to the referenced object
+}
+
 message EventMessage {
     uint64 seq = 1;               // Global message sequence; monotonically increasing; clients must not rely on adjacency
     uint64 ts_ms = 2;             // Unix timestamp in milliseconds when the server receives the publish request
@@ -32,6 +37,7 @@ message EventMessage {
     uint64 principal = 4;         // Sender principal
     repeated uint64 recipients = 5;  // Recipient principal list
     bytes payload = 6;
+    repeated ObjectKey object_keys = 7;  // Object capability references attached to this message
 }
 
 message ChannelInfo {
@@ -71,8 +77,9 @@ message PublishRequest {
     string token = 2;
     uint64 channel_id = 3;
     uint64 seq = 4;               // Expected message sequence; must equal the current max_seq + 1
-    repeated uint64 recipients = 6;  // Recipient principal list
-    bytes payload = 5;
+    repeated uint64 recipients = 5;  // Recipient principal list
+    bytes payload = 6;
+    repeated ObjectKey object_keys = 7;  // Object capability references to attach to the message
 }
 
 message PublishResponse {
@@ -82,8 +89,9 @@ message PublishAutoSeqRequest {
     uint64 principal = 1;
     string token = 2;
     uint64 channel_id = 3;
-    repeated uint64 recipients = 5;  // Recipient principal list
-    bytes payload = 4;
+    repeated uint64 recipients = 4;  // Recipient principal list
+    bytes payload = 5;
+    repeated ObjectKey object_keys = 6;  // Object capability references to attach to the message
 }
 
 message PublishAutoSeqResponse {
@@ -117,6 +125,53 @@ message SubscribeResponse {
         EventMessage message = 1; // Message delivered by the subscription
         uint64 next_seq = 2;      // Suggested next start when from_seq > max_seq; the stream then ends
     }
+}
+
+// ============================================================================
+// ObjectStorageService - object storage
+// ============================================================================
+
+service ObjectStorageService {
+    rpc WriteObject(WriteObjectRequest) returns (WriteObjectResponse);
+    rpc GetObjectMetadata(GetObjectMetadataRequest) returns (GetObjectMetadataResponse);
+    rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
+}
+
+message WriteObjectRequest {
+    uint64 principal = 1;
+    string token = 2;
+    string name = 3;
+    string type = 4;
+    string description = 5;
+    bytes data = 6;
+}
+
+message WriteObjectResponse {
+    uint64 object_id = 1;         // Global monotonically increasing object ID; 0 is reserved; committed IDs are not reused
+    string object_token = 2;      // Opaque credential for authorizing subsequent operations on this object
+}
+
+message GetObjectMetadataRequest {
+    uint64 object_id = 1;
+    string object_token = 2;
+}
+
+message GetObjectMetadataResponse {
+    string name = 1;
+    string type = 2;
+    string description = 3;
+    uint64 nbytes = 4;            // Total size of the object data in bytes
+}
+
+message ReadObjectRequest {
+    uint64 object_id = 1;
+    string object_token = 2;
+    uint64 offset = 3;            // Zero-based byte offset from the beginning of the object
+    uint64 nbytes = 4;            // Maximum number of bytes to return; must be greater than 0
+}
+
+message ReadObjectResponse {
+    bytes data = 1;               // Up to nbytes bytes starting at offset
 }
 
 // ============================================================================

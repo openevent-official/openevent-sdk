@@ -12,7 +12,7 @@ Build a wheel from this repository:
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.1-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.4.2-py3-none-any.whl
 ```
 
 For local development, generate protobuf code and use the source tree directly:
@@ -117,7 +117,7 @@ Only `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT`,
 `RESOURCE_EXHAUSTED`, and `ABORTED` for Publish seq-CAS conflicts guarantee that
 this publish was not committed. Treat every other non-`OK` status, or the absence
 of a gRPC status, as uncertain. A non-commit guarantee does not imply that the
-cause is recoverable; see section 2.7 of [API.md](API.md) for the full contract.
+cause is recoverable; see section 2.8 of [API.md](API.md) for the full contract.
 
 Recommended flow:
 
@@ -140,6 +140,74 @@ The server provides one linearized order for mutations and non-streaming statefu
 reads. A GetStatus, Fetch, or other non-streaming read issued after a write RPC
 returned success must observe the complete write. Subscribe is excluded and does
 not replace GetStatus/Fetch for watermark-based reconciliation.
+
+## Write and Reference Objects
+
+Object storage and message `object_keys` are available through the generated
+stubs. The high-level client deliberately remains a small wrapper and does not
+add separate object methods or ObjectKey parameters.
+
+```python
+from openevent.sdk.proto import openevent_pb2, openevent_pb2_grpc
+
+objects = openevent_pb2_grpc.ObjectStorageServiceStub(client.channel)
+events = openevent_pb2_grpc.EventServiceStub(client.channel)
+
+written = objects.WriteObject(
+    openevent_pb2.WriteObjectRequest(
+        principal=principal,
+        token=token,
+        name="report.json",
+        type="application/json",
+        description="Agent output",
+        data=b'{"result":"ok"}',
+    ),
+    timeout=client.timeout,
+)
+key = openevent_pb2.ObjectKey(
+    object_id=written.object_id,
+    object_token=written.object_token,
+)
+
+published = events.PublishAutoSeq(
+    openevent_pb2.PublishAutoSeqRequest(
+        principal=principal,
+        token=token,
+        channel_id=channel_id,
+        payload=b"report ready",
+        object_keys=[key],
+    ),
+    timeout=client.timeout,
+)
+```
+
+Read metadata and a byte range with the ObjectKey. Object reads do not carry a
+principal token because the ObjectKey itself is the authorization:
+
+```python
+metadata = objects.GetObjectMetadata(
+    openevent_pb2.GetObjectMetadataRequest(
+        object_id=key.object_id,
+        object_token=key.object_token,
+    ),
+    timeout=client.timeout,
+)
+chunk = objects.ReadObject(
+    openevent_pb2.ReadObjectRequest(
+        object_id=key.object_id,
+        object_token=key.object_token,
+        offset=0,
+        nbytes=metadata.nbytes,
+    ),
+    timeout=client.timeout,
+)
+```
+
+Objects are immutable, nonempty, and limited to 4 MiB. ObjectKeys are permanent,
+transferable bearer credentials; attaching one to a message discloses it to every
+caller that can read that message, including administrative readers. Do not log
+object tokens. See sections 2.6 and 4 of [API.md](API.md) for exact limits, range
+behavior, errors, and uncertain WriteObject results.
 
 ## Fetch Messages
 

@@ -37,6 +37,27 @@ def client() -> OpenEventClient:
     return OpenEventClient(_event_target())
 
 
+@pytest.fixture(scope="session")
+def business_channel():
+    message_limit = 64 * 1024 * 1024
+    channel = grpc.insecure_channel(
+        _event_target(),
+        options=(
+            ("grpc.max_send_message_length", message_limit),
+            ("grpc.max_receive_message_length", message_limit),
+        ),
+    )
+    try:
+        yield channel
+    finally:
+        channel.close()
+
+
+@pytest.fixture(scope="session")
+def object_stub(business_channel):
+    return openevent_pb2_grpc.ObjectStorageServiceStub(business_channel)
+
+
 def _token(admin: AdminClient, principal: int) -> str:
     return admin.add_token(target_principal=principal).binding.token
 
@@ -572,3 +593,241 @@ def test_uncertain_publish_result_is_reconciled_without_direct_retry(
     )
     assert len(cas_matches) == 1
     assert cas_matches[0].seq == cas_seq
+
+
+def test_object_write_metadata_and_partial_read(admin: AdminClient, object_stub) -> None:
+    principal = 1801
+    token = _token(admin, principal)
+    data = b"object\x00payload"
+    written = object_stub.WriteObject(
+        openevent_pb2.WriteObjectRequest(
+            principal=principal,
+            token=token,
+            name="payload.bin",
+            type="application/octet-stream",
+            description="sdk e2e object",
+            data=data,
+        )
+    )
+    assert written.object_id > 0
+    assert len(written.object_token) == 43
+
+    key = dict(object_id=written.object_id, object_token=written.object_token)
+    metadata = object_stub.GetObjectMetadata(openevent_pb2.GetObjectMetadataRequest(**key))
+    assert metadata.name == "payload.bin"
+    assert metadata.type == "application/octet-stream"
+    assert metadata.description == "sdk e2e object"
+    assert metadata.nbytes == len(data)
+
+    full = object_stub.ReadObject(
+        openevent_pb2.ReadObjectRequest(**key, offset=0, nbytes=(1 << 64) - 1)
+    )
+    middle = object_stub.ReadObject(
+        openevent_pb2.ReadObjectRequest(**key, offset=2, nbytes=5)
+    )
+    tail = object_stub.ReadObject(
+        openevent_pb2.ReadObjectRequest(**key, offset=len(data) - 2, nbytes=100)
+    )
+    eof = object_stub.ReadObject(
+        openevent_pb2.ReadObjectRequest(**key, offset=len(data), nbytes=1)
+    )
+    assert full.data == data
+    assert middle.data == data[2:7]
+    assert tail.data == data[-2:]
+    assert eof.data == b""
+
+    invalid_reads = [
+        (openevent_pb2.ReadObjectRequest(**key, offset=len(data) + 1, nbytes=1), grpc.StatusCode.OUT_OF_RANGE),
+        (openevent_pb2.ReadObjectRequest(**key, offset=0, nbytes=0), grpc.StatusCode.INVALID_ARGUMENT),
+        (
+            openevent_pb2.ReadObjectRequest(
+                object_id=written.object_id, object_token="wrong-token", offset=0, nbytes=1
+            ),
+            grpc.StatusCode.NOT_FOUND,
+        ),
+        (
+            openevent_pb2.ReadObjectRequest(
+                object_id=written.object_id + (1 << 32),
+                object_token=written.object_token,
+                offset=0,
+                nbytes=1,
+            ),
+            grpc.StatusCode.NOT_FOUND,
+        ),
+        (
+            openevent_pb2.ReadObjectRequest(
+                object_id=0, object_token=written.object_token, offset=0, nbytes=1
+            ),
+            grpc.StatusCode.INVALID_ARGUMENT,
+        ),
+        (
+            openevent_pb2.ReadObjectRequest(
+                object_id=written.object_id, object_token="", offset=0, nbytes=1
+            ),
+            grpc.StatusCode.INVALID_ARGUMENT,
+        ),
+    ]
+    for request, expected_code in invalid_reads:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            object_stub.ReadObject(request)
+        _assert_rpc_code(exc_info, expected_code)
+
+    invalid_writes = [
+        openevent_pb2.WriteObjectRequest(
+            principal=principal, token=token, name="", type="type", data=b"x"
+        ),
+        openevent_pb2.WriteObjectRequest(
+            principal=principal, token=token, name="name", type="", data=b"x"
+        ),
+        openevent_pb2.WriteObjectRequest(
+            principal=principal, token=token, name="name", type="type", data=b""
+        ),
+        openevent_pb2.WriteObjectRequest(
+            principal=principal, token=token, name="n" * 256, type="type", data=b"x"
+        ),
+        openevent_pb2.WriteObjectRequest(
+            principal=principal, token=token, name="name", type="t" * 256, data=b"x"
+        ),
+        openevent_pb2.WriteObjectRequest(
+            principal=principal,
+            token=token,
+            name="name",
+            type="type",
+            description="d" * 4097,
+            data=b"x",
+        ),
+        openevent_pb2.WriteObjectRequest(
+            principal=principal,
+            token=token,
+            name="name",
+            type="type",
+            data=b"x" * (4 * 1024 * 1024 + 1),
+        ),
+    ]
+    for request in invalid_writes:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            object_stub.WriteObject(request)
+        _assert_rpc_code(exc_info, grpc.StatusCode.INVALID_ARGUMENT)
+
+    next_object = object_stub.WriteObject(
+        openevent_pb2.WriteObjectRequest(
+            principal=principal,
+            token=token,
+            name="next",
+            type="application/octet-stream",
+            data=b"next",
+        )
+    )
+    assert next_object.object_id > written.object_id
+
+
+def test_message_object_references(
+    admin: AdminClient, client: OpenEventClient, object_stub, business_channel
+) -> None:
+    principal = 1901
+    reader = 1902
+    token = _token(admin, principal)
+    reader_token = _token(admin, reader)
+    channel_id = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-object-references"),
+        visibility=openevent_pb2.VISIBILITY_PUBLIC,
+    ).channel.channel_id
+    written = object_stub.WriteObject(
+        openevent_pb2.WriteObjectRequest(
+            principal=principal,
+            token=token,
+            name="referenced",
+            type="application/octet-stream",
+            data=b"transferable capability",
+        )
+    )
+    key = openevent_pb2.ObjectKey(
+        object_id=written.object_id, object_token=written.object_token
+    )
+    event_stub = openevent_pb2_grpc.EventServiceStub(business_channel)
+    published = event_stub.PublishAutoSeq(
+        openevent_pb2.PublishAutoSeqRequest(
+            principal=principal,
+            token=token,
+            channel_id=channel_id,
+            payload=b"object references",
+            object_keys=[key, key],
+        )
+    )
+
+    fetched = client.fetch(
+        principal=reader,
+        token=reader_token,
+        from_seq=published.seq,
+        limit=1,
+        channels=[channel_id],
+    )
+    assert len(fetched.messages) == 1
+    assert [item.object_id for item in fetched.messages[0].object_keys] == [
+        written.object_id,
+        written.object_id,
+    ]
+    stream = event_stub.Subscribe(
+        openevent_pb2.SubscribeRequest(
+            principal=reader, token=reader_token, from_seq=published.seq
+        )
+    )
+    subscribed = next(stream)
+    stream.cancel()
+    assert [item.object_id for item in subscribed.message.object_keys] == [
+        written.object_id,
+        written.object_id,
+    ]
+    listed = admin.list_messages(from_seq=published.seq, limit=1)
+    assert len(listed.messages) == 1
+    assert len(listed.messages[0].object_keys) == 2
+
+    transferred = object_stub.ReadObject(
+        openevent_pb2.ReadObjectRequest(
+            object_id=fetched.messages[0].object_keys[0].object_id,
+            object_token=fetched.messages[0].object_keys[0].object_token,
+            nbytes=1024,
+        )
+    )
+    assert transferred.data == b"transferable capability"
+
+    exactly_1024 = [key] * 1024
+    accepted = event_stub.PublishAutoSeq(
+        openevent_pb2.PublishAutoSeqRequest(
+            principal=principal,
+            token=token,
+            channel_id=channel_id,
+            object_keys=exactly_1024,
+        )
+    )
+    watermark = client.get_status(principal=principal, token=token).max_seq
+    assert watermark == accepted.seq
+
+    with pytest.raises(grpc.RpcError) as exc_info:
+        event_stub.PublishAutoSeq(
+            openevent_pb2.PublishAutoSeqRequest(
+                principal=principal,
+                token=token,
+                channel_id=channel_id,
+                object_keys=[key] * 1025,
+            )
+        )
+    _assert_rpc_code(exc_info, grpc.StatusCode.INVALID_ARGUMENT)
+    assert client.get_status(principal=principal, token=token).max_seq == watermark
+
+    invalid_key = openevent_pb2.ObjectKey(
+        object_id=written.object_id, object_token="wrong-token"
+    )
+    with pytest.raises(grpc.RpcError) as exc_info:
+        event_stub.PublishAutoSeq(
+            openevent_pb2.PublishAutoSeqRequest(
+                principal=principal,
+                token=token,
+                channel_id=channel_id,
+                object_keys=[key, invalid_key, key],
+            )
+        )
+    _assert_rpc_code(exc_info, grpc.StatusCode.NOT_FOUND)
+    assert client.get_status(principal=principal, token=token).max_seq == watermark

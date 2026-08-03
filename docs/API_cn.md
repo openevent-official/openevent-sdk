@@ -2,8 +2,8 @@
 
 [English version](API.md)
 
-> 版本: 0.4.1
-> 日期: 2026-07-17
+> 版本: 0.4.2
+> 日期: 2026-07-31
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
 [`proto/admin.proto`](../proto/admin.proto) 的公开 API 行为。它不描述服务端存储、恢复、部署
@@ -12,18 +12,20 @@
 ## 1. 基础约定
 
 - 所有接口通过 `gRPC + Protocol Buffers` 提供。
-- 除 `AdminService` 外，业务请求都携带 `principal + token`。
+- Event、Channel 和对象写入请求携带 `principal + token`；对象读取使用
+  `object_id + object_token`，`AdminService` 两者都不携带。
 - 客户端只依赖 `seq` 作为全局消息位置，不维护独立消息存储 offset。
 - `seq` 单调递增且已提交值不复用；客户端不得依赖序号相邻。
 - 每条 `EventMessage` 包含 `ts_ms`，表示服务端收到发布请求时的 Unix 毫秒时间戳。
 - `payload` 是不透明 bytes，OpenEvent 不解析或校验业务 schema。
-- OpenEvent 保留全部已提交历史消息和 Channel metadata。
+- OpenEvent 保留全部已提交历史消息、Channel metadata 和不可变对象。
 
 ### 1.1 服务划分
 
 | Service | 职责 |
 |---------|------|
 | `EventService` | 状态查询、消息发布、批量拉取、流式订阅 |
+| `ObjectStorageService` | 不可变对象写入、metadata 查询和部分数据读取 |
 | `ChannelService` | Channel 创建、查询、列表、成员管理 |
 | `AdminService` | token 管理和全部消息的管理查询 |
 
@@ -35,14 +37,16 @@
 |--------|------|
 | `UNAUTHENTICATED` | token 缺失、无效，或与 `principal` 不匹配 |
 | `PERMISSION_DENIED` | ACL 检查失败，或调用方无权执行操作 |
-| `NOT_FOUND` | Channel 不存在 |
+| `NOT_FOUND` | Channel 不存在，或对象 capability 不存在/无效 |
 | `ALREADY_EXISTS` | 重复添加成员等资源已存在场景 |
 | `INVALID_ARGUMENT` | 字段缺失、值非法，或 recipients 不满足成员约束 |
-| `RESOURCE_EXHAUSTED` | payload 超过部署上限 |
+| `RESOURCE_EXHAUSTED` | payload 超过上限，或对象存储空间/quota 不足 |
+| `OUT_OF_RANGE` | ReadObject offset 大于对象大小 |
 | `ABORTED` | `Publish.req.seq != max_seq + 1` |
-| `CANCELLED` | 调用被取消；发布请求的提交结果可能不确定 |
-| `DEADLINE_EXCEEDED` | 调用超过 deadline；发布请求的提交结果可能不确定 |
+| `CANCELLED` | 调用被取消；写入结果可能不确定 |
+| `DEADLINE_EXCEEDED` | 调用超过 deadline；写入结果可能不确定 |
 | `UNAVAILABLE` | 服务或依赖当前不可用 |
+| `DATA_LOSS` | committed 对象 metadata 或 data 损坏；服务端会退出，而不是继续提供部分状态 |
 | `INTERNAL` | 未预期错误 |
 
 ### 2.2 消息序列
@@ -80,7 +84,20 @@
 - `only_my_recipient=true` 时只返回或推送 recipients 包含当前 principal 的消息；空 recipients
   不匹配该过滤条件。
 
-### 2.6 读写线性化与提交顺序
+### 2.6 对象 Capability 与消息引用
+
+- `ObjectKey` 由 `object_id + object_token` 组成，是永久 bearer capability。任何同时持有两者的
+  调用方都能读取对象 metadata 和 data，不需要 principal token 或 Channel 权限。
+- 对象 capability 可以转交，当前不能撤销、轮换、删除或在创建后收窄权限。必须把
+  `object_token` 视为秘密。
+- Publish 和 PublishAutoSeq 最多接受 1024 个 `object_keys`。服务端不去重，并按请求顺序保存。
+- 每个引用都必须包含非 0 object ID 和非空 token。格式错误返回 `INVALID_ARGUMENT`；对象不存在、
+  尚未提交或 token 不匹配返回 `NOT_FOUND`。
+- 任一引用无效都会拒绝整条消息，`max_seq` 不推进。引用校验不读取对象 data。
+- Fetch、Subscribe 和管理端 ListMessages 返回完整 ObjectKey；任何有权读取消息的调用方都会取得
+  消息中的全部 capability。
+
+### 2.7 读写线性化与提交顺序
 
 - 所有修改和非流式有状态业务/管理读 RPC 具有一个服务端全局顺序。写请求在该顺序中提交，
   非流式读请求在自己的顺序位置取得一致 snapshot。Subscribe 不属于该全局顺序。
@@ -88,13 +105,15 @@
   之间不会插入另一个 token 或 Channel 修改。
 - RemoveMember 或 DeleteToken 先成功时，排在其后的发布分别返回 `PERMISSION_DENIED` 或
   `UNAUTHENTICATED`；发布先成功时消息保持已提交。
+- WriteObject 在两次有序 metadata 提交之间执行文件 I/O，其他操作可以排在这两个阶段之间。
+  只有 committed 对象可见，最终 metadata 提交才是公开写入点。
 - 写请求只在服务端完成同步持久化后返回成功。成功响应表示修改已经提交并满足服务端持久性承诺。
 - 如果调用方在写 RPC 成功返回后才发起非流式读 RPC，该读必须观察到该写的完整结果。相互重叠
   的修改和非流式读取按服务端全局顺序观察提交前或提交后的完整状态，不能观察部分提交。
 - Subscribe 不提供上述 read-after-write 或与其他 RPC 的串行化保证；需要确定水位和写入可见性时
   使用 GetStatus 和 Fetch。
 
-### 2.7 发布结果不确定时的处理
+### 2.8 发布结果不确定时的处理
 
 如果 `Publish` 或 `PublishAutoSeq` 没有返回成功响应，不能仅凭客户端看到的错误判断消息一定没有
 提交。连接中断、客户端取消、`DEADLINE_EXCEEDED`、部分 `UNAVAILABLE` 等失败可能发生在服务端
@@ -171,6 +190,7 @@ rpc Publish(PublishRequest) returns (PublishResponse);
 - `seq == 当前 max_seq + 1`。
 - Channel 存在且调用方有写权限。
 - recipients 满足 2.5。
+- object_keys 满足 2.6。
 
 | 条件 | 返回 |
 |------|------|
@@ -179,6 +199,8 @@ rpc Publish(PublishRequest) returns (PublishResponse);
 | Channel 不存在 | `NOT_FOUND` |
 | 无写权限 | `PERMISSION_DENIED` |
 | recipient 非成员 | `INVALID_ARGUMENT` |
+| ObjectKey 超过 1024 个、object ID 为 0 或对象 token 为空 | `INVALID_ARGUMENT` |
+| 对象不存在/未提交或对象 token 不匹配 | `NOT_FOUND` |
 
 成功返回空响应。服务端生成 `ts_ms`，消息随后可被有权限的调用方读取或订阅。
 
@@ -243,9 +265,65 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 `SubscribeResponse.message` 表示正常消息；`next_seq` 只用于 `from_seq > max_seq`。客户端取消或
 断开后应记录最后已处理 seq，并从 `seq+1` 重新订阅或 Fetch。
 
-## 4. ChannelService
+## 4. ObjectStorageService
 
-### 4.1 CreateChannel
+ObjectStorageService 运行在业务端口。对象写入使用普通 `principal + token` 认证；metadata 和 data
+读取只使用 ObjectKey capability。
+
+### 4.1 WriteObject
+
+```protobuf
+rpc WriteObject(WriteObjectRequest) returns (WriteObjectResponse);
+```
+
+- `name` 和 `type` 必填，各自的 UTF-8 编码最多 255 bytes。
+- `description` 可以为空，UTF-8 编码最多 4096 bytes。
+- `data` 必须为 `1..4,194,304` bytes。4 MiB 是固定限制，不受消息 payload 配置影响。
+- 服务端把这些字符串作为不透明 metadata 保存，不解释对象内容，也不根据 metadata 生成文件路径。
+- 成功返回非 0、全局递增的 `object_id` 和不透明 `object_token`。ID 可以跳号且不复用；对象不可变。
+- 对象 token 由 CSPRNG 生成 32 bytes，并编码为 43 个无 padding Base64URL 字符。调用方必须把其
+  表示视为不透明值。
+- 只有对象 data 和 metadata 都持久提交后才返回成功。处理开始后的取消、deadline、连接中断或
+  部分服务端错误可能造成结果不确定；客户端取消后，服务端仍会继续提交或清理。
+- API 没有幂等键或按创建者查询接口。成功响应丢失后无法找回 token；不能接受重复不可变对象时，
+  不要盲目重试。
+
+metadata 或 data 大小非法返回 `INVALID_ARGUMENT`；principal/token 无效返回 `UNAUTHENTICATED`；
+存储空间、quota 或 inode 耗尽返回 `RESOURCE_EXHAUSTED`；其他存储可用性故障返回 `UNAVAILABLE`。
+
+### 4.2 GetObjectMetadata
+
+```protobuf
+rpc GetObjectMetadata(GetObjectMetadataRequest) returns (GetObjectMetadataResponse);
+```
+
+返回 committed 对象的 `name`、`type`、`description` 和总 `nbytes`，不读取或校验对象 data 文件。
+
+### 4.3 ReadObject
+
+```protobuf
+rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
+```
+
+`nbytes` 必须大于 0。服务端完整校验 committed 对象后，按以下规则返回范围：
+
+| 条件 | 结果 |
+|------|------|
+| `offset < object size` | 返回 `min(nbytes, object size - offset)` bytes |
+| `offset == object size` | 成功返回空 `data` |
+| `offset > object size` | `OUT_OF_RANGE` |
+| `nbytes == 0` | `INVALID_ARGUMENT` |
+
+`nbytes` 可以是任意正 uint64；服务端先用对象大小减去 offset，再决定响应长度，不会发生范围溢出。
+
+对 GetObjectMetadata 和 ReadObject，`object_id=0` 或对象 token 为空返回 `INVALID_ARGUMENT`；对象
+不存在/未提交和所有 token 不匹配统一返回 `NOT_FOUND`。其他非空 token 作为不透明字符串处理，
+不会仅按语法拒绝。若 committed data 缺失、不是普通文件、大小错误或完整性校验失败，ReadObject
+返回 `DATA_LOSS`；服务端随后以非零状态退出，不继续提供服务。
+
+## 5. ChannelService
+
+### 5.1 CreateChannel
 
 ```protobuf
 rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
@@ -256,7 +334,7 @@ rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
 - 请求 members 去重，创建者只保留一份。
 - 成功响应返回创建后的 ChannelInfo。
 
-### 4.2 GetChannel
+### 5.2 GetChannel
 
 ```protobuf
 rpc GetChannel(GetChannelRequest) returns (GetChannelResponse);
@@ -266,7 +344,7 @@ rpc GetChannel(GetChannelRequest) returns (GetChannelResponse);
 - Channel 不存在返回 `NOT_FOUND`。
 - 无读取权限返回 `PERMISSION_DENIED`。
 
-### 4.3 ListChannels
+### 5.3 ListChannels
 
 ```protobuf
 rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
@@ -279,7 +357,7 @@ rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
 - `CHANNEL_FILTER_OWNED` 返回调用方创建的可见 Channel。
 - 非法 filter 返回 `INVALID_ARGUMENT`。
 
-### 4.4 AddMember
+### 5.4 AddMember
 
 ```protobuf
 rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
@@ -290,7 +368,7 @@ rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
 - Channel 不存在返回 `NOT_FOUND`。
 - 目标已是成员时返回 `ALREADY_EXISTS`。
 
-### 4.5 RemoveMember
+### 5.5 RemoveMember
 
 ```protobuf
 rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
@@ -302,7 +380,7 @@ rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 - 不允许移除创建者本人。
 - 移除非成员目标是幂等成功。
 
-## 5. AdminService
+## 6. AdminService
 
 AdminService 定义在 [`proto/admin.proto`](../proto/admin.proto)，只运行在独立管理端口，不携带
 业务 principal/token。部署必须通过网络隔离或外部授权保护管理端口。
@@ -314,7 +392,7 @@ rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
 rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 ```
 
-### 5.1 ListTokens
+### 6.1 ListTokens
 
 - page_token 是服务端生成的不透明 exclusive cursor；空字符串表示第一页。
 - limit 必填且范围为 `1..1000`。
@@ -324,7 +402,7 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 - 每页内部是一致视图；token 可增删，因此跨页不是强快照。
 - binding 和 page token 都是敏感管理数据，不得写入日志、trace 或错误详情。
 
-### 5.2 ListMessages
+### 6.2 ListMessages
 
 ```protobuf
 rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
@@ -341,9 +419,11 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 - 起点超过尾部时返回空页和尾部下一位置；`next_seq > last_seq` 表示到达本页观察到的尾部。
 - 每页是一致视图，但并发追加可使后续页的 last_seq 增大。
 
-## 6. 兼容性建议
+## 7. 兼容性建议
 
 - 两份 proto 共同组成公开协议契约。
 - 调用方按 gRPC status code 分支，不依赖错误文本。
 - 消费者必须允许 seq 跳号，记录最后已处理 seq，并从 `seq+1` 断点续读。
+- ObjectKey 是凭据。必须保持 repeated 字段顺序、禁止记录 token，也不能假设 capability 附加到
+  一条可读消息后仍保持私密。
 - payload 的业务 schema 放在 Channel protocol 对应的业务协议中。

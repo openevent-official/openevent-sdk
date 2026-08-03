@@ -151,3 +151,61 @@ def test_proto_service_boundaries_and_admin_field_numbers() -> None:
     list_tokens_response = admin_pb2.ListTokensResponse.DESCRIPTOR.fields_by_name
     assert list_tokens_response["bindings"].number == 1
     assert list_tokens_response["next_page_token"].number == 2
+
+
+def test_object_protocol_descriptors_and_reference_order() -> None:
+    object_service = openevent_pb2.DESCRIPTOR.services_by_name["ObjectStorageService"]
+    assert list(object_service.methods_by_name) == [
+        "WriteObject",
+        "GetObjectMetadata",
+        "ReadObject",
+    ]
+
+    object_key = openevent_pb2.ObjectKey.DESCRIPTOR.fields_by_name
+    assert object_key["object_id"].number == 1
+    assert object_key["object_token"].number == 2
+
+    event_message = openevent_pb2.EventMessage.DESCRIPTOR.fields_by_name
+    assert event_message["object_keys"].number == 7
+    publish = openevent_pb2.PublishRequest.DESCRIPTOR.fields_by_name
+    assert publish["recipients"].number == 5
+    assert publish["payload"].number == 6
+    assert publish["object_keys"].number == 7
+    publish_auto = openevent_pb2.PublishAutoSeqRequest.DESCRIPTOR.fields_by_name
+    assert publish_auto["recipients"].number == 4
+    assert publish_auto["payload"].number == 5
+    assert publish_auto["object_keys"].number == 6
+
+    write = openevent_pb2.WriteObjectRequest.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in write.items()} == {
+        "principal": 1,
+        "token": 2,
+        "name": 3,
+        "type": 4,
+        "description": 5,
+        "data": 6,
+    }
+    write_response = openevent_pb2.WriteObjectResponse.DESCRIPTOR.fields_by_name
+    assert write_response["object_id"].number == 1
+    assert write_response["object_token"].number == 2
+    metadata = openevent_pb2.GetObjectMetadataResponse.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in metadata.items()} == {
+        "name": 1,
+        "type": 2,
+        "description": 3,
+        "nbytes": 4,
+    }
+    read = openevent_pb2.ReadObjectRequest.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in read.items()} == {
+        "object_id": 1,
+        "object_token": 2,
+        "offset": 3,
+        "nbytes": 4,
+    }
+
+    first = openevent_pb2.ObjectKey(object_id=1, object_token="first")
+    second = openevent_pb2.ObjectKey(object_id=2, object_token="second")
+    message = openevent_pb2.EventMessage(object_keys=[first, second, first])
+    request = openevent_pb2.PublishAutoSeqRequest(object_keys=[first, second, first])
+    assert [key.object_id for key in message.object_keys] == [1, 2, 1]
+    assert [key.object_id for key in request.object_keys] == [1, 2, 1]

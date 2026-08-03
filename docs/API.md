@@ -2,8 +2,8 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.4.1
-> Date: 2026-07-17
+> Version: 0.4.2
+> Date: 2026-07-31
 
 This document defines the public behavior of the business protocol
 [`proto/openevent.proto`](../proto/openevent.proto) and management protocol
@@ -13,7 +13,8 @@ recovery, deployment topology, or internal execution mechanisms.
 ## 1. Basic Conventions
 
 - All APIs use `gRPC + Protocol Buffers`.
-- Business requests carry `principal + token`; `AdminService` does not.
+- Event, Channel, and object-write requests carry `principal + token`.
+  Object reads use `object_id + object_token`; `AdminService` carries neither.
 - Clients use `seq` as the global message position and do not maintain a separate
   message-storage offset.
 - Committed `seq` values increase monotonically and are not reused. Clients must
@@ -21,13 +22,14 @@ recovery, deployment topology, or internal execution mechanisms.
 - Each `EventMessage` contains `ts_ms`, the Unix millisecond timestamp when the
   server received the publish request.
 - `payload` is opaque bytes; OpenEvent does not parse or validate its business schema.
-- OpenEvent retains all committed messages and Channel metadata.
+- OpenEvent retains all committed messages, Channel metadata, and immutable objects.
 
 ### 1.1 Services
 
 | Service | Responsibility |
 |---------|----------------|
 | `EventService` | Status queries, publishing, batch fetch, and streaming subscription |
+| `ObjectStorageService` | Immutable object writes, metadata queries, and partial data reads |
 | `ChannelService` | Channel creation, queries, listing, and member management |
 | `AdminService` | Token management and administrative message queries |
 
@@ -39,14 +41,16 @@ recovery, deployment topology, or internal execution mechanisms.
 |--------|---------|
 | `UNAUTHENTICATED` | token is missing, invalid, or not bound to `principal` |
 | `PERMISSION_DENIED` | ACL check failed or the operation is not allowed |
-| `NOT_FOUND` | Channel does not exist |
+| `NOT_FOUND` | Channel does not exist, or an object capability is absent or invalid |
 | `ALREADY_EXISTS` | Resource already exists, such as an existing member |
 | `INVALID_ARGUMENT` | Missing/invalid fields or invalid recipients |
-| `RESOURCE_EXHAUSTED` | payload exceeds the deployment limit |
+| `RESOURCE_EXHAUSTED` | payload exceeds its limit or object storage has insufficient space/quota |
+| `OUT_OF_RANGE` | ReadObject offset is greater than the object size |
 | `ABORTED` | `Publish.req.seq != max_seq + 1` |
-| `CANCELLED` | The call was cancelled; a publish result may be uncertain |
-| `DEADLINE_EXCEEDED` | The call exceeded its deadline; a publish result may be uncertain |
+| `CANCELLED` | The call was cancelled; a write result may be uncertain |
+| `DEADLINE_EXCEEDED` | The call exceeded its deadline; a write result may be uncertain |
 | `UNAVAILABLE` | Service or dependency is unavailable |
+| `DATA_LOSS` | Committed object metadata or data is corrupt; the server exits rather than serve partial state |
 | `INTERNAL` | Unexpected error |
 
 ### 2.2 Message Sequence
@@ -87,7 +91,24 @@ System channel `channel_id=0`:
 - With `only_my_recipient=true`, only messages targeting the current principal
   are returned or pushed; messages with empty recipients do not match.
 
-### 2.6 Read/Write Linearization and Commit Ordering
+### 2.6 Object Capabilities and Message References
+
+- `ObjectKey` contains `object_id + object_token` and is a permanent bearer
+  capability. Anyone holding both values can read the object's metadata and data
+  without a principal token or Channel permission.
+- Object capabilities can be transferred. They cannot currently be revoked,
+  rotated, deleted, or restricted after creation. Treat `object_token` as a secret.
+- Publish and PublishAutoSeq accept at most 1024 `object_keys`. The server does
+  not deduplicate the list and stores it in request order.
+- Every reference must have a nonzero object ID and a nonempty token. Malformed
+  references return `INVALID_ARGUMENT`; a missing object, uncommitted object, or
+  token mismatch returns `NOT_FOUND`.
+- If any reference is invalid, the complete message is rejected and `max_seq`
+  does not advance. Reference validation does not read object data.
+- Fetch, Subscribe, and administrative ListMessages return complete ObjectKeys.
+  Any caller allowed to read a message therefore receives every capability in it.
+
+### 2.7 Read/Write Linearization and Commit Ordering
 
 - All mutations and non-streaming stateful business/administrative reads have one
   server-side global order. Writes commit in that order, while non-streaming reads
@@ -96,6 +117,9 @@ System channel `channel_id=0`:
   committed state preceding the message commit.
 - If RemoveMember or DeleteToken commits first, a later publish returns
   `PERMISSION_DENIED` or `UNAUTHENTICATED`. A message committed first remains valid.
+- WriteObject performs file I/O between two ordered metadata commits; other
+  operations may be ordered between those phases. Only committed objects are
+  visible, and its final metadata commit is the public write point.
 - A write returns success only after it has been synchronously and durably
   persisted. Success means the mutation satisfies the server durability contract.
 - A non-streaming read issued after a write RPC returned success must observe the
@@ -105,7 +129,7 @@ System channel `channel_id=0`:
 - Subscribe does not provide this read-after-write or cross-RPC serialization
   guarantee. Use GetStatus and Fetch when a stable watermark is required.
 
-### 2.7 Handling an Uncertain Publish Result
+### 2.8 Handling an Uncertain Publish Result
 
 When Publish or PublishAutoSeq does not return a successful response, the client
 cannot always conclude that the message was not committed. A broken connection,
@@ -190,8 +214,8 @@ rpc Publish(PublishRequest) returns (PublishResponse);
 ```
 
 Publishes with a client-specified CAS seq. Success requires valid authentication,
-an allowed payload size, `seq == max_seq+1`, an existing writable Channel, and
-valid recipients.
+an allowed payload size, `seq == max_seq+1`, an existing writable Channel, valid
+recipients, and valid object capabilities.
 
 | Condition | Status |
 |-----------|--------|
@@ -200,6 +224,8 @@ valid recipients.
 | Missing Channel | `NOT_FOUND` |
 | No write permission | `PERMISSION_DENIED` |
 | Non-member recipient | `INVALID_ARGUMENT` |
+| More than 1024 ObjectKeys, object ID 0, or empty object token | `INVALID_ARGUMENT` |
+| Missing/uncommitted object or object token mismatch | `NOT_FOUND` |
 
 Success returns an empty response. The server sets `ts_ms` before the message is
 made available to authorized readers.
@@ -261,9 +287,78 @@ to other RPCs.
 the `from_seq > max_seq` boundary. After disconnect, resume from the last
 processed `seq + 1` using Subscribe or Fetch.
 
-## 4. ChannelService
+## 4. ObjectStorageService
 
-### 4.1 CreateChannel
+ObjectStorageService runs on the business endpoint. Object writes use normal
+`principal + token` authentication. Metadata and data reads use only the
+ObjectKey capability.
+
+### 4.1 WriteObject
+
+```protobuf
+rpc WriteObject(WriteObjectRequest) returns (WriteObjectResponse);
+```
+
+- `name` and `type` are required and each must encode to at most 255 UTF-8 bytes.
+- `description` may be empty and must encode to at most 4096 UTF-8 bytes.
+- `data` must contain `1..4,194,304` bytes. The 4 MiB limit is fixed and is not
+  affected by the message payload configuration.
+- The server stores these strings as opaque metadata and does not interpret the
+  object contents or derive a file path from metadata.
+- Success returns a nonzero globally increasing `object_id` and an opaque
+  `object_token`. IDs can contain gaps and are never reused. Objects are immutable.
+- The object token is a 32-byte CSPRNG value encoded as 43 unpadded Base64URL
+  characters. Callers must treat its representation as opaque.
+- Success is returned only after object data and metadata are durably committed.
+  A cancellation, deadline, connection loss, or some server error after processing
+  starts can leave the result uncertain. The server continues committing or
+  cleaning up after client cancellation.
+- The API has no idempotency key or query-by-creator operation. If the success
+  response is lost, the token cannot be recovered; do not blindly retry when
+  duplicate immutable objects are unacceptable.
+
+Invalid metadata or data size returns `INVALID_ARGUMENT`. Invalid principal/token
+returns `UNAUTHENTICATED`. Storage space, quota, or inode exhaustion returns
+`RESOURCE_EXHAUSTED`; other storage availability failures return `UNAVAILABLE`.
+
+### 4.2 GetObjectMetadata
+
+```protobuf
+rpc GetObjectMetadata(GetObjectMetadataRequest) returns (GetObjectMetadataResponse);
+```
+
+Returns the committed object's `name`, `type`, `description`, and total `nbytes`.
+It does not read or verify the object data file.
+
+### 4.3 ReadObject
+
+```protobuf
+rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
+```
+
+`nbytes` must be positive. The server validates the complete committed object and
+then returns a range according to these rules:
+
+| Condition | Result |
+|-----------|--------|
+| `offset < object size` | Return `min(nbytes, object size - offset)` bytes |
+| `offset == object size` | Success with empty `data` |
+| `offset > object size` | `OUT_OF_RANGE` |
+| `nbytes == 0` | `INVALID_ARGUMENT` |
+
+`nbytes` may be any positive uint64; ranges cannot overflow because the server
+subtracts offset from the object size before choosing the response length.
+
+For GetObjectMetadata and ReadObject, `object_id=0` or an empty object token is
+`INVALID_ARGUMENT`. A missing/uncommitted object and every token mismatch return
+the same `NOT_FOUND` result. A nonempty token is otherwise treated as opaque and
+is not rejected based on syntax. ReadObject returns `DATA_LOSS` if committed data
+is missing, not a regular file, has the wrong size, or fails its integrity check;
+the server then shuts down with a nonzero exit rather than continue serving.
+
+## 5. ChannelService
+
+### 5.1 CreateChannel
 
 ```protobuf
 rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
@@ -274,7 +369,7 @@ rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
 - Request members are deduplicated.
 - Success returns the created ChannelInfo.
 
-### 4.2 GetChannel
+### 5.2 GetChannel
 
 ```protobuf
 rpc GetChannel(GetChannelRequest) returns (GetChannelResponse);
@@ -283,7 +378,7 @@ rpc GetChannel(GetChannelRequest) returns (GetChannelResponse);
 Read permission follows section 2.4. Missing Channel returns `NOT_FOUND`; denied
 access returns `PERMISSION_DENIED`.
 
-### 4.3 ListChannels
+### 5.3 ListChannels
 
 ```protobuf
 rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
@@ -292,7 +387,7 @@ rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
 Pagination is not currently supported. The server filters by read permission and
 then applies ALL, JOINED, or OWNED. Invalid filter returns `INVALID_ARGUMENT`.
 
-### 4.4 AddMember
+### 5.4 AddMember
 
 ```protobuf
 rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
@@ -301,7 +396,7 @@ rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
 Only the creator may add members. System Channel changes are denied, missing
 Channel returns `NOT_FOUND`, and an existing member returns `ALREADY_EXISTS`.
 
-### 4.5 RemoveMember
+### 5.5 RemoveMember
 
 ```protobuf
 rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
@@ -310,7 +405,7 @@ rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 Only the creator may remove members. The creator cannot be removed. Removing a
 non-member is idempotent success.
 
-## 5. AdminService
+## 6. AdminService
 
 AdminService is defined in [`proto/admin.proto`](../proto/admin.proto), runs only
 on the admin endpoint, and carries no business principal/token. Deployments must
@@ -323,7 +418,7 @@ rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
 rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 ```
 
-### 5.1 ListTokens
+### 6.1 ListTokens
 
 - page_token is an opaque exclusive cursor; empty means the first page.
 - limit is required in `1..1000`.
@@ -334,7 +429,7 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
   cross-RPC snapshot.
 - Bindings and page tokens are sensitive and must not be logged or traced.
 
-### 5.2 ListMessages
+### 6.2 ListMessages
 
 ```protobuf
 rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
@@ -352,10 +447,13 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 - A cursor beyond the tail returns an empty page and the tail's next position.
 - Concurrent appends may increase last_seq on later pages.
 
-## 6. Compatibility Guidance
+## 7. Compatibility Guidance
 
 - Both proto files together form the public protocol contract.
 - Branch on gRPC status codes, not error text.
 - Consumers must accept seq gaps, record the last processed seq, and resume from
   `seq + 1`.
+- ObjectKey values are credentials. Preserve repeated-field order, do not log
+  tokens, and do not assume an object capability remains private after attaching
+  it to a readable message.
 - Put payload schema rules in the business protocol named by Channel protocol.

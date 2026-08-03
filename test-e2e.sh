@@ -44,7 +44,7 @@ import sys
 required = {
     "grpc": "grpcio",
     "pytest": "pytest",
-    "openevent.sdk": "openevent-sdk>=0.4.1",
+    "openevent.sdk": "openevent-sdk>=0.4.2",
 }
 missing = [requirement for module, requirement in required.items() if importlib.util.find_spec(module) is None]
 if missing:
@@ -53,19 +53,27 @@ if missing:
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.4.1", file=sys.stderr)
+    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.4.2", file=sys.stderr)
     sys.exit(2)
 parts = tuple(int(part) for part in version.split(".")[:3] if part.isdigit())
-if parts < (0, 4, 1):
-    print(f"openevent-sdk>=0.4.1 is required for e2e tests, found {version}", file=sys.stderr)
+if parts < (0, 4, 2):
+    print(f"openevent-sdk>=0.4.2 is required for e2e tests, found {version}", file=sys.stderr)
     sys.exit(2)
 
 from openevent.sdk import AdminClient
-from openevent.sdk.proto import admin_pb2
+from openevent.sdk.proto import admin_pb2, openevent_pb2
 
 service = admin_pb2.DESCRIPTOR.services_by_name.get("AdminService")
 if service is None or "ListMessages" not in service.methods_by_name or not hasattr(AdminClient, "list_messages"):
     print("installed openevent-sdk does not provide AdminService.ListMessages", file=sys.stderr)
+    sys.exit(2)
+object_service = openevent_pb2.DESCRIPTOR.services_by_name.get("ObjectStorageService")
+required_object_methods = {"WriteObject", "GetObjectMetadata", "ReadObject"}
+if object_service is None or not required_object_methods.issubset(object_service.methods_by_name):
+    print("installed openevent-sdk does not provide the required ObjectStorageService protocol", file=sys.stderr)
+    sys.exit(2)
+if "object_keys" not in openevent_pb2.EventMessage.DESCRIPTOR.fields_by_name:
+    print("installed openevent-sdk does not provide EventMessage.object_keys", file=sys.stderr)
     sys.exit(2)
 PY
 
