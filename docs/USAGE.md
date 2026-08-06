@@ -12,7 +12,7 @@ Build a wheel from this repository:
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.2-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.4.3-py3-none-any.whl
 ```
 
 For local development, generate protobuf code and use the source tree directly:
@@ -37,10 +37,22 @@ token = "user-token"
 `grpc.insecure_channel`. If your deployment requires TLS or a custom channel,
 create a `grpc.Channel` and pass it with `OpenEventClient(target, channel=...)`.
 
-`OpenEventClient` and `AdminClient` accept an optional constructor `timeout`
-with a 30-second default. The value is used by every non-streaming RPC; pass
-`None` at construction to disable those deadlines. `subscribe` is a long-lived
-stream and does not use the client timeout.
+`OpenEventClient` and `AdminClient` accept a constructor `timeout` with a
+30-second default. It must be a finite number greater than zero; `None`, boolean,
+zero, negative, NaN, and infinite values raise `ValueError`. The same deadline is
+used by every RPC, including the complete lifetime of a `subscribe` stream, so
+high-level client calls cannot wait forever.
+
+Call `client.close()` when the client is no longer needed, or use it as a
+context manager. `close()` is idempotent. A client closes only the gRPC channel
+it created itself; a channel passed with `channel=...` remains owned by the
+caller and must be closed by the caller. The destructor is only a fallback for
+an omitted explicit close because Python does not guarantee when it runs.
+
+```python
+with OpenEventClient("127.0.0.1:9527") as scoped_client:
+    status = scoped_client.get_status(principal, token)
+```
 
 ## Create a Channel
 
@@ -143,41 +155,31 @@ not replace GetStatus/Fetch for watermark-based reconciliation.
 
 ## Write and Reference Objects
 
-Object storage and message `object_keys` are available through the generated
-stubs. The high-level client deliberately remains a small wrapper and does not
-add separate object methods or ObjectKey parameters.
+The high-level client exposes object storage methods and accepts `object_keys`
+when publishing.
 
 ```python
-from openevent.sdk.proto import openevent_pb2, openevent_pb2_grpc
+from openevent.sdk.proto import openevent_pb2
 
-objects = openevent_pb2_grpc.ObjectStorageServiceStub(client.channel)
-events = openevent_pb2_grpc.EventServiceStub(client.channel)
-
-written = objects.WriteObject(
-    openevent_pb2.WriteObjectRequest(
-        principal=principal,
-        token=token,
-        name="report.json",
-        type="application/json",
-        description="Agent output",
-        data=b'{"result":"ok"}',
-    ),
-    timeout=client.timeout,
+written = client.write_object(
+    principal=principal,
+    token=token,
+    name="report.json",
+    type="application/json",
+    description="Agent output",
+    data=b'{"result":"ok"}',
 )
 key = openevent_pb2.ObjectKey(
     object_id=written.object_id,
     object_token=written.object_token,
 )
 
-published = events.PublishAutoSeq(
-    openevent_pb2.PublishAutoSeqRequest(
-        principal=principal,
-        token=token,
-        channel_id=channel_id,
-        payload=b"report ready",
-        object_keys=[key],
-    ),
-    timeout=client.timeout,
+published = client.publish_auto_seq(
+    principal=principal,
+    token=token,
+    channel_id=channel_id,
+    payload=b"report ready",
+    object_keys=[key],
 )
 ```
 
@@ -185,21 +187,15 @@ Read metadata and a byte range with the ObjectKey. Object reads do not carry a
 principal token because the ObjectKey itself is the authorization:
 
 ```python
-metadata = objects.GetObjectMetadata(
-    openevent_pb2.GetObjectMetadataRequest(
-        object_id=key.object_id,
-        object_token=key.object_token,
-    ),
-    timeout=client.timeout,
+metadata = client.get_object_metadata(
+    object_id=key.object_id,
+    object_token=key.object_token,
 )
-chunk = objects.ReadObject(
-    openevent_pb2.ReadObjectRequest(
-        object_id=key.object_id,
-        object_token=key.object_token,
-        offset=0,
-        nbytes=metadata.nbytes,
-    ),
-    timeout=client.timeout,
+chunk = client.read_object(
+    object_id=key.object_id,
+    object_token=key.object_token,
+    offset=0,
+    nbytes=metadata.nbytes,
 )
 ```
 
@@ -253,7 +249,12 @@ response = client.fetch(
 such as `cancel()` while applying the SDK sequence check described below:
 
 ```python
-for item in client.subscribe(principal, token, from_seq=0):
+for item in client.subscribe(
+    principal,
+    token,
+    from_seq=0,
+    channels=[channel_id],
+):
     if item.HasField("message"):
         message = item.message
         print(message.seq, message.payload)
@@ -262,8 +263,10 @@ for item in client.subscribe(principal, token, from_seq=0):
 ```
 
 `from_seq=0` means wait for messages published after the subscription is
-established. If the connection is interrupted, the client should record the last
-processed `seq` and resume from `seq + 1`.
+established. Pass `channels=[...]` to receive only readable messages from those
+Channels; omit it or pass an empty list to disable Channel filtering. The stream
+ends with `DEADLINE_EXCEEDED` when the client timeout expires. Record the last
+processed `seq` and resume from `seq + 1` after any interruption.
 
 The high-level `OpenEventClient.subscribe` iterator suppresses repeated or
 backward message `seq` values within one stream. Persist the last processed `seq`

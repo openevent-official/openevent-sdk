@@ -11,7 +11,7 @@
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.2-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.4.3-py3-none-any.whl
 ```
 
 开发本仓库时，可以直接生成 protobuf 代码并使用源码：
@@ -35,9 +35,18 @@ token = "user-token"
 `target` 是 gRPC 服务地址。默认使用 `grpc.insecure_channel`；如果你的部署需要 TLS
 或自定义 channel，可以创建 `grpc.Channel` 后传给 `OpenEventClient(target, channel=...)`。
 
-`OpenEventClient` 和 `AdminClient` 的构造函数都接受可选 `timeout`，默认值为 30 秒。该值作用于
-所有非流式 RPC；构造时传入 `None` 可关闭这些 deadline。`subscribe` 是长期流，不使用客户端
-timeout。
+`OpenEventClient` 和 `AdminClient` 的构造函数都接受 `timeout`，默认值为 30 秒。该值必须是有限且
+大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`。同一 deadline 作用于
+所有 RPC，包括 `subscribe` 整条 stream 的生命周期，因此高层 client 调用不会无限等待。
+
+client 不再使用时应调用 `client.close()`，也可以把它用作 context manager。`close()` 可以重复调用。
+client 只关闭自己创建的 gRPC channel；通过 `channel=...` 传入的 channel 始终由调用方管理和关闭。
+析构函数只是在遗漏显式关闭时兜底，因为 Python 不保证它何时执行。
+
+```python
+with OpenEventClient("127.0.0.1:9527") as scoped_client:
+    status = scoped_client.get_status(principal, token)
+```
 
 ## 创建 Channel
 
@@ -129,40 +138,30 @@ SDK 自建的 gRPC channel 默认把单条收发消息上限设为 64 MiB，以�
 
 ## 写入和引用对象
 
-对象存储和消息 `object_keys` 通过生成式 stub 使用。高层 client 有意保持为小型封装，不额外增加
-对象方法或 ObjectKey 参数。
+高层 client 暴露对象存储方法，发布消息时也可以直接传入 `object_keys`。
 
 ```python
-from openevent.sdk.proto import openevent_pb2, openevent_pb2_grpc
+from openevent.sdk.proto import openevent_pb2
 
-objects = openevent_pb2_grpc.ObjectStorageServiceStub(client.channel)
-events = openevent_pb2_grpc.EventServiceStub(client.channel)
-
-written = objects.WriteObject(
-    openevent_pb2.WriteObjectRequest(
-        principal=principal,
-        token=token,
-        name="report.json",
-        type="application/json",
-        description="Agent output",
-        data=b'{"result":"ok"}',
-    ),
-    timeout=client.timeout,
+written = client.write_object(
+    principal=principal,
+    token=token,
+    name="report.json",
+    type="application/json",
+    description="Agent output",
+    data=b'{"result":"ok"}',
 )
 key = openevent_pb2.ObjectKey(
     object_id=written.object_id,
     object_token=written.object_token,
 )
 
-published = events.PublishAutoSeq(
-    openevent_pb2.PublishAutoSeqRequest(
-        principal=principal,
-        token=token,
-        channel_id=channel_id,
-        payload=b"report ready",
-        object_keys=[key],
-    ),
-    timeout=client.timeout,
+published = client.publish_auto_seq(
+    principal=principal,
+    token=token,
+    channel_id=channel_id,
+    payload=b"report ready",
+    object_keys=[key],
 )
 ```
 
@@ -170,21 +169,15 @@ published = events.PublishAutoSeq(
 就是授权：
 
 ```python
-metadata = objects.GetObjectMetadata(
-    openevent_pb2.GetObjectMetadataRequest(
-        object_id=key.object_id,
-        object_token=key.object_token,
-    ),
-    timeout=client.timeout,
+metadata = client.get_object_metadata(
+    object_id=key.object_id,
+    object_token=key.object_token,
 )
-chunk = objects.ReadObject(
-    openevent_pb2.ReadObjectRequest(
-        object_id=key.object_id,
-        object_token=key.object_token,
-        offset=0,
-        nbytes=metadata.nbytes,
-    ),
-    timeout=client.timeout,
+chunk = client.read_object(
+    object_id=key.object_id,
+    object_token=key.object_token,
+    offset=0,
+    nbytes=metadata.nbytes,
 )
 ```
 
@@ -234,7 +227,12 @@ response = client.fetch(
 SDK 序号检查：
 
 ```python
-for item in client.subscribe(principal, token, from_seq=0):
+for item in client.subscribe(
+    principal,
+    token,
+    from_seq=0,
+    channels=[channel_id],
+):
     if item.HasField("message"):
         message = item.message
         print(message.seq, message.payload)
@@ -242,8 +240,10 @@ for item in client.subscribe(principal, token, from_seq=0):
         print("next seq:", item.next_seq)
 ```
 
-`from_seq=0` 表示从当前最新位置之后开始等待新消息。如果连接断开，客户端应记录已经处理到的
-`seq`，之后从 `seq + 1` 重新订阅或拉取。
+`from_seq=0` 表示从当前最新位置之后开始等待新消息。传入 `channels=[...]` 时只接收这些 Channel
+中调用方可读的消息；省略或传入空列表时不按 Channel ID 过滤。客户端 timeout 到期时 stream 以
+`DEADLINE_EXCEEDED` 结束。任何中断发生前都应记录已经处理到的 `seq`，之后从 `seq + 1` 重新订阅
+或拉取。
 
 高层 `OpenEventClient.subscribe` 迭代器会在同一条 stream 内按消息 `seq` 丢弃重复或回退的消息。
 跨连接仍需由调用方持久化最后处理的 `seq`，并从 `seq + 1` 恢复；需要原始 stream 时可以直接

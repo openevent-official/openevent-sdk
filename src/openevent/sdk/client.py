@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
+from numbers import Real
 from typing import Iterable, Optional
+
 import grpc
 
 try:
@@ -17,6 +20,15 @@ _DEFAULT_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
     ("grpc.max_receive_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
 )
+
+
+def _validate_rpc_timeout(timeout: object) -> float:
+    if isinstance(timeout, bool) or not isinstance(timeout, Real):
+        raise ValueError("timeout must be a finite number greater than 0")
+    value = float(timeout)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("timeout must be a finite number greater than 0")
+    return value
 
 
 class _DeduplicatingSubscribeStream:
@@ -46,12 +58,52 @@ class OpenEventClient:
         self,
         target: str,
         channel: Optional[grpc.Channel] = None,
-        timeout: Optional[float] = _DEFAULT_RPC_TIMEOUT_SECONDS,
+        timeout: float = _DEFAULT_RPC_TIMEOUT_SECONDS,
     ):
-        self.channel = channel or grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
+        self._closed = True
+        self._owns_channel = channel is None
         self.timeout = timeout
-        self.event_stub = openevent_pb2_grpc.EventServiceStub(self.channel)
-        self.channel_stub = openevent_pb2_grpc.ChannelServiceStub(self.channel)
+        self.channel = (
+            grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
+            if channel is None
+            else channel
+        )
+        self._closed = False
+        try:
+            self.event_stub = openevent_pb2_grpc.EventServiceStub(self.channel)
+            self.object_stub = openevent_pb2_grpc.ObjectStorageServiceStub(self.channel)
+            self.channel_stub = openevent_pb2_grpc.ChannelServiceStub(self.channel)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        if getattr(self, "_owns_channel", False):
+            self.channel.close()
+
+    def __enter__(self) -> OpenEventClient:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @property
+    def timeout(self) -> float:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: object) -> None:
+        self._timeout = _validate_rpc_timeout(value)
 
     def get_status(self, principal: int, token: str):
         return self.event_stub.GetStatus(
@@ -67,6 +119,7 @@ class OpenEventClient:
         seq: int,
         payload: bytes,
         recipients: Iterable[int] = (),
+        object_keys: Iterable[openevent_pb2.ObjectKey] = (),
     ):
         return self.event_stub.Publish(
             openevent_pb2.PublishRequest(
@@ -76,6 +129,7 @@ class OpenEventClient:
                 seq=seq,
                 recipients=list(recipients),
                 payload=payload,
+                object_keys=list(object_keys),
             ),
             timeout=self.timeout,
         )
@@ -87,6 +141,7 @@ class OpenEventClient:
         channel_id: int,
         payload: bytes,
         recipients: Iterable[int] = (),
+        object_keys: Iterable[openevent_pb2.ObjectKey] = (),
     ):
         return self.event_stub.PublishAutoSeq(
             openevent_pb2.PublishAutoSeqRequest(
@@ -95,6 +150,7 @@ class OpenEventClient:
                 channel_id=channel_id,
                 recipients=list(recipients),
                 payload=payload,
+                object_keys=list(object_keys),
             ),
             timeout=self.timeout,
         )
@@ -126,6 +182,7 @@ class OpenEventClient:
         token: str,
         from_seq: int = 0,
         only_my_recipient: bool = False,
+        channels: Iterable[int] = (),
     ):
         stream = self.event_stub.Subscribe(
             openevent_pb2.SubscribeRequest(
@@ -133,9 +190,52 @@ class OpenEventClient:
                 token=token,
                 from_seq=from_seq,
                 only_my_recipient=only_my_recipient,
-            )
+                channels=list(channels),
+            ),
+            timeout=self.timeout,
         )
         return _DeduplicatingSubscribeStream(stream)
+
+    def write_object(
+        self,
+        principal: int,
+        token: str,
+        name: str,
+        type: str,
+        data: bytes,
+        description: str = "",
+    ):
+        return self.object_stub.WriteObject(
+            openevent_pb2.WriteObjectRequest(
+                principal=principal,
+                token=token,
+                name=name,
+                type=type,
+                description=description,
+                data=data,
+            ),
+            timeout=self.timeout,
+        )
+
+    def get_object_metadata(self, object_id: int, object_token: str):
+        return self.object_stub.GetObjectMetadata(
+            openevent_pb2.GetObjectMetadataRequest(
+                object_id=object_id,
+                object_token=object_token,
+            ),
+            timeout=self.timeout,
+        )
+
+    def read_object(self, object_id: int, object_token: str, offset: int, nbytes: int):
+        return self.object_stub.ReadObject(
+            openevent_pb2.ReadObjectRequest(
+                object_id=object_id,
+                object_token=object_token,
+                offset=offset,
+                nbytes=nbytes,
+            ),
+            timeout=self.timeout,
+        )
 
     def create_channel(
         self,

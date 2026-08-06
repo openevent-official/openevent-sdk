@@ -43,8 +43,9 @@ import sys
 
 required = {
     "grpc": "grpcio",
+    "packaging": "packaging",
     "pytest": "pytest",
-    "openevent.sdk": "openevent-sdk>=0.4.2",
+    "openevent.sdk": "openevent-sdk>=0.4.3",
 }
 missing = [requirement for module, requirement in required.items() if importlib.util.find_spec(module) is None]
 if missing:
@@ -53,14 +54,20 @@ if missing:
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.4.2", file=sys.stderr)
+    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.4.3", file=sys.stderr)
     sys.exit(2)
-parts = tuple(int(part) for part in version.split(".")[:3] if part.isdigit())
-if parts < (0, 4, 2):
-    print(f"openevent-sdk>=0.4.2 is required for e2e tests, found {version}", file=sys.stderr)
+from packaging.version import InvalidVersion, Version
+
+try:
+    installed_version = Version(version)
+except InvalidVersion:
+    print(f"installed openevent-sdk has an invalid version: {version}", file=sys.stderr)
+    sys.exit(2)
+if installed_version < Version("0.4.3"):
+    print(f"openevent-sdk>=0.4.3 is required for e2e tests, found {version}", file=sys.stderr)
     sys.exit(2)
 
-from openevent.sdk import AdminClient
+from openevent.sdk import AdminClient, OpenEventClient
 from openevent.sdk.proto import admin_pb2, openevent_pb2
 
 service = admin_pb2.DESCRIPTOR.services_by_name.get("AdminService")
@@ -74,6 +81,18 @@ if object_service is None or not required_object_methods.issubset(object_service
     sys.exit(2)
 if "object_keys" not in openevent_pb2.EventMessage.DESCRIPTOR.fields_by_name:
     print("installed openevent-sdk does not provide EventMessage.object_keys", file=sys.stderr)
+    sys.exit(2)
+subscribe_fields = openevent_pb2.SubscribeRequest.DESCRIPTOR.fields_by_name
+if "channels" not in subscribe_fields or subscribe_fields["channels"].number != 5:
+    print("installed openevent-sdk does not provide SubscribeRequest.channels=5", file=sys.stderr)
+    sys.exit(2)
+required_client_methods = {
+    "write_object",
+    "get_object_metadata",
+    "read_object",
+}
+if any(not hasattr(OpenEventClient, name) for name in required_client_methods):
+    print("installed openevent-sdk does not provide high-level object methods", file=sys.stderr)
     sys.exit(2)
 PY
 

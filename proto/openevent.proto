@@ -118,6 +118,7 @@ message SubscribeRequest {
     string token = 2;
     uint64 from_seq = 3;          // Starting sequence; 0 starts after the current max_seq
     bool only_my_recipient = 4;   // If true, push only messages whose recipients contain principal
+    repeated uint64 channels = 5; // Push only messages from these channel IDs; empty disables Channel filtering
 }
 
 message SubscribeResponse {

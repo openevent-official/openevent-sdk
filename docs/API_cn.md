@@ -2,8 +2,8 @@
 
 [English version](API.md)
 
-> 版本: 0.4.2
-> 日期: 2026-07-31
+> 版本: 0.4.3
+> 日期: 2026-08-05
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
 [`proto/admin.proto`](../proto/admin.proto) 的公开 API 行为。它不描述服务端存储、恢复、部署
@@ -46,7 +46,7 @@
 | `CANCELLED` | 调用被取消；写入结果可能不确定 |
 | `DEADLINE_EXCEEDED` | 调用超过 deadline；写入结果可能不确定 |
 | `UNAVAILABLE` | 服务或依赖当前不可用 |
-| `DATA_LOSS` | committed 对象 metadata 或 data 损坏；服务端会退出，而不是继续提供部分状态 |
+| `DATA_LOSS` | 持久化存储损坏；服务端会退出，而不是继续提供部分状态 |
 | `INTERNAL` | 未预期错误 |
 
 ### 2.2 消息序列
@@ -110,8 +110,9 @@
 - 写请求只在服务端完成同步持久化后返回成功。成功响应表示修改已经提交并满足服务端持久性承诺。
 - 如果调用方在写 RPC 成功返回后才发起非流式读 RPC，该读必须观察到该写的完整结果。相互重叠
   的修改和非流式读取按服务端全局顺序观察提交前或提交后的完整状态，不能观察部分提交。
-- Subscribe 不提供上述 read-after-write 或与其他 RPC 的串行化保证；需要确定水位和写入可见性时
-  使用 GetStatus 和 Fetch。
+- Subscribe 与并发 RPC 之间没有顺序点，但每批会等待共享 snapshot 覆盖该批开始前已完成的提交；
+  这些提交最晚在下一次成功的 100 ms snapshot 刷新后可见。Subscribe 不提供固定水位，需要固定
+  水位读取或对账时使用 GetStatus 和 Fetch。
 
 ### 2.8 发布结果不确定时的处理
 
@@ -252,9 +253,13 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 按全局 seq 顺序推送当前调用方可见的消息。
 
 - token 与 principal 匹配。
-- Subscribe 不进入非流式读写的全局线性化顺序，不提供相对于其他 RPC 的 read-after-write 保证。
-- 不接受 Channel 过滤；订阅范围始终是全局消息流。
+- Subscribe 不进入非流式读写的全局线性化顺序，与并发 RPC 之间没有线性化点。订阅读取使用服务端
+  每 100 ms 在成功提交后刷新的全局共享 snapshot；每批会等待该 snapshot 覆盖批次开始前已完成的
+  提交。
+- `channels` 为空时不按 Channel ID 过滤；非空时只推送所列 Channel 中调用方可读的消息。
 - `only_my_recipient=true` 时应用 recipient 过滤。
+- 被 Channel ACL、channels 或 recipient 过滤的记录不产生响应，但服务端扫描会消费这些记录并继续
+  向后处理。
 
 | `from_seq` | 行为 |
 |------------|------|
@@ -290,6 +295,9 @@ rpc WriteObject(WriteObjectRequest) returns (WriteObjectResponse);
 
 metadata 或 data 大小非法返回 `INVALID_ARGUMENT`；principal/token 无效返回 `UNAUTHENTICATED`；
 存储空间、quota 或 inode 耗尽返回 `RESOURCE_EXHAUSTED`；其他存储可用性故障返回 `UNAVAILABLE`。
+任何 RocksDB 操作失败在返回对应错误后都会使服务端退出；持久化记录 bytes 不符合内部格式时返回
+`DATA_LOSS`，同样会退出。如果最终 metadata 提交返回错误，服务端无法可靠判断对象是否已经提交，
+因此会退出。重启恢复会保留已经 committed 的对象，或清理仍处于 preparing 状态的对象。
 
 ### 4.2 GetObjectMetadata
 
@@ -305,7 +313,7 @@ rpc GetObjectMetadata(GetObjectMetadataRequest) returns (GetObjectMetadataRespon
 rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
 ```
 
-`nbytes` 必须大于 0。服务端完整校验 committed 对象后，按以下规则返回范围：
+`nbytes` 必须大于 0。服务端校验 committed 对象的文件类型和总大小后，只按以下规则读取请求范围：
 
 | 条件 | 结果 |
 |------|------|
@@ -318,8 +326,9 @@ rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
 
 对 GetObjectMetadata 和 ReadObject，`object_id=0` 或对象 token 为空返回 `INVALID_ARGUMENT`；对象
 不存在/未提交和所有 token 不匹配统一返回 `NOT_FOUND`。其他非空 token 作为不透明字符串处理，
-不会仅按语法拒绝。若 committed data 缺失、不是普通文件、大小错误或完整性校验失败，ReadObject
-返回 `DATA_LOSS`；服务端随后以非零状态退出，不继续提供服务。
+不会仅按语法拒绝。若 committed data 缺失、不是普通文件或大小错误，ReadObject 返回
+`DATA_LOSS`；服务端随后以非零状态退出，不继续提供服务。服务端不维护内容摘要，因此无法发现
+同大小的外部内容变更。
 
 ## 5. ChannelService
 

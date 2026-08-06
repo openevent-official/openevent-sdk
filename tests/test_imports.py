@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
 from openevent.sdk import AdminClient, OpenEventClient
+from openevent.sdk import admin_client as admin_client_module
+from openevent.sdk import client as client_module
 from openevent.sdk.admin_client import AdminClient as ModuleAdminClient
 from openevent.sdk.client import OpenEventClient as ModuleOpenEventClient
 from openevent.sdk.proto import admin_pb2, openevent_pb2
@@ -72,9 +76,112 @@ def test_client_timeout_is_forwarded_to_unary_rpc() -> None:
     client.event_stub = stub
     client.timeout = 1.25
     client.get_status(1, "token")
-    client.timeout = None
-    client.get_status(1, "token")
-    assert stub.timeouts == [1.25, None]
+    assert stub.timeouts == [1.25]
+
+
+@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
+@pytest.mark.parametrize(
+    "timeout",
+    [None, True, False, 0, -1, float("inf"), float("-inf"), float("nan")],
+)
+def test_client_timeout_must_be_finite_and_positive(client_type, timeout) -> None:
+    with pytest.raises(ValueError, match="finite number greater than 0"):
+        client_type("unused", timeout=timeout)
+
+    client = client_type.__new__(client_type)
+    with pytest.raises(ValueError, match="finite number greater than 0"):
+        client.timeout = timeout
+
+
+@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
+def test_client_timeout_defaults_to_thirty_seconds(client_type) -> None:
+    with client_type("127.0.0.1:1") as client:
+        assert client.timeout == 30.0
+
+
+class _CloseTrackingChannel:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _patch_stub_constructors(monkeypatch) -> None:
+    monkeypatch.setattr(client_module.openevent_pb2_grpc, "EventServiceStub", lambda channel: object())
+    monkeypatch.setattr(
+        client_module.openevent_pb2_grpc, "ObjectStorageServiceStub", lambda channel: object()
+    )
+    monkeypatch.setattr(
+        client_module.openevent_pb2_grpc, "ChannelServiceStub", lambda channel: object()
+    )
+    monkeypatch.setattr(admin_client_module.admin_pb2_grpc, "AdminServiceStub", lambda channel: object())
+
+
+@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
+def test_client_closes_owned_channel_once(monkeypatch, client_type) -> None:
+    channel = _CloseTrackingChannel()
+    monkeypatch.setattr(client_module.grpc, "insecure_channel", lambda target, options: channel)
+    _patch_stub_constructors(monkeypatch)
+
+    client = client_type("unused")
+    client.close()
+    client.close()
+    client.__del__()
+
+    assert channel.close_calls == 1
+
+
+@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
+def test_client_does_not_close_injected_channel(monkeypatch, client_type) -> None:
+    channel = _CloseTrackingChannel()
+    _patch_stub_constructors(monkeypatch)
+
+    client = client_type("unused", channel=channel)
+    client.close()
+    client.__del__()
+
+    assert channel.close_calls == 0
+
+
+@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
+def test_client_context_manager_closes_owned_channel(monkeypatch, client_type) -> None:
+    channel = _CloseTrackingChannel()
+    monkeypatch.setattr(client_module.grpc, "insecure_channel", lambda target, options: channel)
+    _patch_stub_constructors(monkeypatch)
+
+    with client_type("unused") as client:
+        assert client.channel is channel
+
+    assert channel.close_calls == 1
+
+
+@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
+def test_client_closes_owned_channel_when_stub_construction_fails(
+    monkeypatch, client_type
+) -> None:
+    channel = _CloseTrackingChannel()
+    monkeypatch.setattr(client_module.grpc, "insecure_channel", lambda target, options: channel)
+    _patch_stub_constructors(monkeypatch)
+
+    def fail(channel):
+        raise RuntimeError("stub construction failed")
+
+    if client_type is OpenEventClient:
+        monkeypatch.setattr(client_module.openevent_pb2_grpc, "EventServiceStub", fail)
+    else:
+        monkeypatch.setattr(admin_client_module.admin_pb2_grpc, "AdminServiceStub", fail)
+
+    with pytest.raises(RuntimeError, match="stub construction failed"):
+        client_type("unused")
+
+    assert channel.close_calls == 1
+
+
+@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
+def test_client_destructor_tolerates_partial_initialization(client_type) -> None:
+    client = client_type.__new__(client_type)
+    client.__del__()
 
 
 def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
@@ -94,8 +201,12 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
             return True
 
     class Stub:
-        def Subscribe(self, request):
+        def Subscribe(self, request, timeout=None):
             assert request.principal == 7
+            assert request.token == "token"
+            assert request.from_seq == 2
+            assert list(request.channels) == [11, 12]
+            assert timeout == 2.5
             self.stream = Stream(
                 [
                     openevent_pb2.SubscribeResponse(
@@ -118,11 +229,14 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
     client = OpenEventClient.__new__(OpenEventClient)
     stub = Stub()
     client.event_stub = stub
-    responses = list(client.subscribe(principal=7, token="token", from_seq=2))
+    client.timeout = 2.5
+    responses = list(
+        client.subscribe(principal=7, token="token", from_seq=2, channels=[11, 12])
+    )
 
     assert [response.message.seq for response in responses if response.HasField("message")] == [2, 4]
     assert responses[-1].next_seq == 5
-    stream = client.subscribe(principal=7, token="token", from_seq=2)
+    stream = client.subscribe(principal=7, token="token", from_seq=2, channels=[11, 12])
     assert stream.cancel()
     assert stub.stream.cancelled
 
@@ -151,6 +265,9 @@ def test_proto_service_boundaries_and_admin_field_numbers() -> None:
     list_tokens_response = admin_pb2.ListTokensResponse.DESCRIPTOR.fields_by_name
     assert list_tokens_response["bindings"].number == 1
     assert list_tokens_response["next_page_token"].number == 2
+
+    subscribe_request = openevent_pb2.SubscribeRequest.DESCRIPTOR.fields_by_name
+    assert subscribe_request["channels"].number == 5
 
 
 def test_object_protocol_descriptors_and_reference_order() -> None:
@@ -209,3 +326,87 @@ def test_object_protocol_descriptors_and_reference_order() -> None:
     request = openevent_pb2.PublishAutoSeqRequest(object_keys=[first, second, first])
     assert [key.object_id for key in message.object_keys] == [1, 2, 1]
     assert [key.object_id for key in request.object_keys] == [1, 2, 1]
+
+
+def test_high_level_object_and_reference_requests_are_complete() -> None:
+    event_calls = []
+    object_calls = []
+
+    class EventStub:
+        def Publish(self, request, timeout=None):
+            event_calls.append(("publish", request, timeout))
+            return openevent_pb2.PublishResponse()
+
+        def PublishAutoSeq(self, request, timeout=None):
+            event_calls.append(("publish_auto_seq", request, timeout))
+            return openevent_pb2.PublishAutoSeqResponse(seq=9)
+
+    class ObjectStub:
+        def WriteObject(self, request, timeout=None):
+            object_calls.append(("write", request, timeout))
+            return openevent_pb2.WriteObjectResponse(object_id=3, object_token="object-token")
+
+        def GetObjectMetadata(self, request, timeout=None):
+            object_calls.append(("metadata", request, timeout))
+            return openevent_pb2.GetObjectMetadataResponse(nbytes=4)
+
+        def ReadObject(self, request, timeout=None):
+            object_calls.append(("read", request, timeout))
+            return openevent_pb2.ReadObjectResponse(data=b"data")
+
+    client = OpenEventClient.__new__(OpenEventClient)
+    client.event_stub = EventStub()
+    client.object_stub = ObjectStub()
+    client.timeout = 4.5
+    first = openevent_pb2.ObjectKey(object_id=1, object_token="first")
+    second = openevent_pb2.ObjectKey(object_id=2, object_token="second")
+
+    client.publish(
+        principal=7,
+        token="principal-token",
+        channel_id=8,
+        seq=9,
+        recipients=[10, 11],
+        payload=b"publish",
+        object_keys=[first, second, first],
+    )
+    client.publish_auto_seq(
+        principal=7,
+        token="principal-token",
+        channel_id=8,
+        recipients=[11, 10],
+        payload=b"auto",
+        object_keys=[second, first],
+    )
+    written = client.write_object(
+        principal=7,
+        token="principal-token",
+        name="name",
+        type="application/octet-stream",
+        description="description",
+        data=b"data",
+    )
+    metadata = client.get_object_metadata(written.object_id, written.object_token)
+    data = client.read_object(written.object_id, written.object_token, offset=1, nbytes=2)
+
+    assert [call[0] for call in event_calls] == ["publish", "publish_auto_seq"]
+    assert all(call[2] == 4.5 for call in event_calls)
+    assert list(event_calls[0][1].recipients) == [10, 11]
+    assert [key.object_id for key in event_calls[0][1].object_keys] == [1, 2, 1]
+    assert list(event_calls[1][1].recipients) == [11, 10]
+    assert [key.object_id for key in event_calls[1][1].object_keys] == [2, 1]
+
+    assert [call[0] for call in object_calls] == ["write", "metadata", "read"]
+    assert all(call[2] == 4.5 for call in object_calls)
+    assert object_calls[0][1].principal == 7
+    assert object_calls[0][1].token == "principal-token"
+    assert object_calls[0][1].name == "name"
+    assert object_calls[0][1].type == "application/octet-stream"
+    assert object_calls[0][1].description == "description"
+    assert object_calls[0][1].data == b"data"
+    assert object_calls[1][1].object_id == 3
+    assert object_calls[1][1].object_token == "object-token"
+    assert object_calls[2][1].offset == 1
+    assert object_calls[2][1].nbytes == 2
+    assert metadata.nbytes == 4
+    assert data.data == b"data"

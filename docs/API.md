@@ -2,8 +2,8 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.4.2
-> Date: 2026-07-31
+> Version: 0.4.3
+> Date: 2026-08-05
 
 This document defines the public behavior of the business protocol
 [`proto/openevent.proto`](../proto/openevent.proto) and management protocol
@@ -50,7 +50,7 @@ recovery, deployment topology, or internal execution mechanisms.
 | `CANCELLED` | The call was cancelled; a write result may be uncertain |
 | `DEADLINE_EXCEEDED` | The call exceeded its deadline; a write result may be uncertain |
 | `UNAVAILABLE` | Service or dependency is unavailable |
-| `DATA_LOSS` | Committed object metadata or data is corrupt; the server exits rather than serve partial state |
+| `DATA_LOSS` | Persistent storage is corrupt; the server exits rather than serve partial state |
 | `INTERNAL` | Unexpected error |
 
 ### 2.2 Message Sequence
@@ -126,8 +126,11 @@ System channel `channel_id=0`:
   complete result of that write. Overlapping mutations and non-streaming reads
   observe the complete state before or after a commit according to the server
   global order, never a partial commit.
-- Subscribe does not provide this read-after-write or cross-RPC serialization
-  guarantee. Use GetStatus and Fetch when a stable watermark is required.
+- Subscribe has no ordering point relative to concurrent RPCs, but a batch waits
+  for the shared snapshot to cover commits completed before that batch began.
+  This visibility may take until the next successful 100 ms snapshot refresh and
+  does not provide a stable watermark. Use GetStatus and Fetch for fixed-watermark
+  reads or reconciliation.
 
 ### 2.8 Handling an Uncertain Publish Result
 
@@ -272,10 +275,14 @@ Filtering never moves next_seq backward.
 rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 ```
 
-Pushes messages visible to the caller in global seq order. It has no Channel
-filter; `only_my_recipient` is supported. Subscribe is outside the non-streaming
-read/write linearization order and provides no read-after-write guarantee relative
-to other RPCs.
+Pushes messages visible to the caller in global seq order. Empty `channels`
+disables Channel filtering; otherwise only readable messages from the listed
+Channel IDs are pushed. Normal Channel ACL and `only_my_recipient` filtering
+still apply. Filtered records do not produce responses but are consumed by the
+server's scan. Subscribe is outside the non-streaming read/write linearization
+order and has no linearization point relative to concurrent RPCs. Subscription
+reads use a server-wide snapshot refreshed every 100 ms after successful commits;
+a batch waits until that snapshot covers commits completed before the batch began.
 
 | `from_seq` | Behavior |
 |------------|----------|
@@ -320,6 +327,11 @@ rpc WriteObject(WriteObjectRequest) returns (WriteObjectResponse);
 Invalid metadata or data size returns `INVALID_ARGUMENT`. Invalid principal/token
 returns `UNAUTHENTICATED`. Storage space, quota, or inode exhaustion returns
 `RESOURCE_EXHAUSTED`; other storage availability failures return `UNAVAILABLE`.
+Any RocksDB operation failure causes the server to exit after returning its error;
+bytes that violate the persisted record format are `DATA_LOSS` and also cause
+exit. If the final metadata commit reports an error, the server exits because it
+cannot safely determine whether the object became committed. Recovery keeps a
+committed object or removes its remaining preparing state.
 
 ### 4.2 GetObjectMetadata
 
@@ -336,8 +348,8 @@ It does not read or verify the object data file.
 rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
 ```
 
-`nbytes` must be positive. The server validates the complete committed object and
-then returns a range according to these rules:
+`nbytes` must be positive. The server checks the committed object's file type and
+total size, then reads only the requested range according to these rules:
 
 | Condition | Result |
 |-----------|--------|
@@ -353,8 +365,9 @@ For GetObjectMetadata and ReadObject, `object_id=0` or an empty object token is
 `INVALID_ARGUMENT`. A missing/uncommitted object and every token mismatch return
 the same `NOT_FOUND` result. A nonempty token is otherwise treated as opaque and
 is not rejected based on syntax. ReadObject returns `DATA_LOSS` if committed data
-is missing, not a regular file, has the wrong size, or fails its integrity check;
-the server then shuts down with a nonzero exit rather than continue serving.
+is missing, not a regular file, or has the wrong size; the server then shuts down
+with a nonzero exit rather than continue serving. The server does not maintain a
+content digest, so same-size external changes are not detected.
 
 ## 5. ChannelService
 
