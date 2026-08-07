@@ -2,7 +2,7 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.4.3
+> Version: 0.4.4
 > Date: 2026-08-05
 
 This document defines the public behavior of the business protocol
@@ -130,7 +130,7 @@ System channel `channel_id=0`:
   for the shared snapshot to cover commits completed before that batch began.
   This visibility may take until the next successful 100 ms snapshot refresh and
   does not provide a stable watermark. Use GetStatus and Fetch for fixed-watermark
-  reads or reconciliation.
+  reads.
 
 ### 2.8 Handling an Uncertain Publish Result
 
@@ -168,33 +168,6 @@ The table applies only to terminal statuses produced by a conforming OpenEvent
 server. If a proxy, load balancer, or client can synthesize the same status after
 forwarding the request, and the deployment cannot prove that it happened before
 forwarding, treat the outcome as uncertain.
-
-Do not immediately retry a publish with an uncertain result. Instead:
-
-1. Before publishing, record the current `max_seq` and retain the request's
-   channel ID, principal, recipients, and payload. The payload's application
-   protocol should carry a unique event ID.
-2. After the failure, call GetStatus and record `reconcile_max_seq`. Because that
-   read is ordered after the earlier publish, this watermark must include the
-   publish if it committed.
-3. Fetch from the pre-publish `max_seq + 1`, following `next_seq` until the scan
-   passes `reconcile_max_seq`. Subscribe may help find a matching message quickly,
-   but it cannot by itself prove absence because filtered seq values produce no
-   progress response.
-4. For Publish, first inspect the explicitly requested seq. For PublishAutoSeq,
-   inspect the scanned range using the unique event ID or complete request data.
-5. Treat a matching message as success and use its seq. Only after confirming
-   that no match exists may the caller decide to issue a new publish request.
-
-If an application can concurrently publish identical content, payload and request
-fields cannot reliably identify one attempt; a unique application event ID is
-required.
-
-Reconciliation must use an identity that is still authenticated and authorized
-to read the target Channel, and its channel/recipient filters must include the
-candidate message. If the token was revoked or Channel read access was removed,
-business Fetch cannot prove the outcome; use another authorized identity or a
-protected administrative query.
 
 ## 3. EventService
 
@@ -250,7 +223,11 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 
 - token must match principal.
 - limit must be in `1..1000`.
-- Empty channels means no Channel filter; otherwise normal ACL still applies.
+- Empty channels means no Channel filter. When non-empty, every listed Channel
+  must exist and be readable by the caller; otherwise the whole request returns
+  an error: `NOT_FOUND` for a missing Channel and `PERMISSION_DENIED` for an
+  unreadable Channel. After validation, normal ACL still applies to the selected
+  Channels.
 - `only_my_recipient=true` enables recipient filtering.
 
 | `from_seq` | Behavior |
@@ -259,7 +236,9 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 | `> max_seq` | Empty result with `next_seq=max_seq+1`, `last_seq=max_seq` |
 | `1..max_seq` | Scan visible messages from this seq |
 
-The response contains at most limit visible messages. A server may end a page
+The response contains at most limit visible messages. Explicit channel permissions
+are validated before scanning, so one failed Channel never produces a partial
+response. A server may end a page
 early because of scan or response-size budgets, so a short page, or an empty page
 after scanning invisible messages, does not imply end of stream. A single
 returnable message may exceed the page's soft size budget but remains subject to
@@ -268,6 +247,8 @@ same cursor. `next_seq` is the suggested continuation point and `last_seq` is th
 highest committed seq observed by this response. Continue while
 `next_seq <= last_seq`; a larger next_seq means the observed tail was reached.
 Filtering never moves next_seq backward.
+If a scanned message refers to a Channel that is not present, the call returns
+`INTERNAL`; this does not mark persistent storage corrupt or stop the server.
 
 ### 3.5 Subscribe
 
@@ -276,13 +257,21 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 ```
 
 Pushes messages visible to the caller in global seq order. Empty `channels`
-disables Channel filtering; otherwise only readable messages from the listed
-Channel IDs are pushed. Normal Channel ACL and `only_my_recipient` filtering
-still apply. Filtered records do not produce responses but are consumed by the
-server's scan. Subscribe is outside the non-streaming read/write linearization
+disables Channel filtering. When non-empty, every listed Channel must exist and
+be readable by the caller; otherwise the stream returns an error: `NOT_FOUND` for
+a missing Channel and `PERMISSION_DENIED` for an unreadable Channel. After
+validation, only readable messages from the listed Channel IDs are pushed.
+Normal Channel ACL and `only_my_recipient` filtering still apply. Filtered
+records do not produce responses but are consumed by the server's scan. If an
+explicitly listed Channel becomes unreadable while the stream is running, a
+later batch returns `PERMISSION_DENIED` and ends the stream. Subscribe is outside
+the non-streaming read/write linearization
 order and has no linearization point relative to concurrent RPCs. Subscription
 reads use a server-wide snapshot refreshed every 100 ms after successful commits;
 a batch waits until that snapshot covers commits completed before the batch began.
+If a scanned message refers to a Channel that is not present, the stream returns
+`INTERNAL` and ends; this does not mark persistent storage corrupt or stop the
+server.
 
 | `from_seq` | Behavior |
 |------------|----------|
@@ -293,6 +282,11 @@ a batch waits until that snapshot covers commits completed before the batch bega
 `SubscribeResponse.message` carries normal messages. `next_seq` is only used for
 the `from_seq > max_seq` boundary. After disconnect, resume from the last
 processed `seq + 1` using Subscribe or Fetch.
+
+When the server begins normal or fatal shutdown, it actively ends every
+established Subscribe stream. Treat this like any other stream interruption:
+record the last processed `seq` and resume from `seq + 1` using Subscribe or
+Fetch.
 
 ## 4. ObjectStorageService
 
@@ -457,6 +451,8 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
   deferred by the budget is not skipped by next_seq.
 - next_seq is the suggested continuation point.
 - last_seq is the highest committed seq observed when the page starts.
+- If a scanned message refers to a Channel that is not present, the call returns
+  `INTERNAL`; this does not mark persistent storage corrupt or stop the server.
 - A cursor beyond the tail returns an empty page and the tail's next position.
 - Concurrent appends may increase last_seq on later pages.
 

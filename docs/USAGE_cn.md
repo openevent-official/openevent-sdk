@@ -11,7 +11,7 @@
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.3-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.4.4-py3-none-any.whl
 ```
 
 开发本仓库时，可以直接生成 protobuf 代码并使用源码：
@@ -110,32 +110,6 @@ SDK 自建的 gRPC channel 默认把单条收发消息上限设为 64 MiB，以�
 响应。调用方注入自定义 channel 时必须自行设置足够的 `grpc.max_send_message_length` 和
 `grpc.max_receive_message_length`。
 
-### 发布失败后的对账
-
-`Publish` 或 `PublishAutoSeq` 遇到连接中断、取消、`DEADLINE_EXCEEDED` 或部分
-`UNAVAILABLE` 时，服务端可能已经完成写入。不要直接重试，否则 `PublishAutoSeq` 可能产生重复
-消息，`Publish` 也可能因原 seq 已提交而返回 `ABORTED`。
-
-只有 `UNAUTHENTICATED`、`PERMISSION_DENIED`、`NOT_FOUND`、`INVALID_ARGUMENT`、
-`RESOURCE_EXHAUSTED`，以及仅适用于 `Publish` seq CAS 冲突的 `ABORTED`，保证本次发布没有提交。
-其他任何非 `OK` 返回或没有 gRPC status 都按结果不确定处理。保证未提交不等于可恢复；详细契约见
-[API_cn.md](API_cn.md) 的 2.8 节。
-
-推荐流程：
-
-1. 发布前记录 `get_status(...).max_seq`，并在 payload 的业务协议中加入唯一事件 ID。
-2. 结果不确定时先再次调用 GetStatus，记录 `reconcile_max_seq`；如果原发布已提交，该水位必须
-   包含它。
-3. 从此前的 `max_seq+1` 开始 Fetch，持续以 `next_seq` 翻页，直到扫描位置超过
-   `reconcile_max_seq`。Subscribe 可以帮助尽快发现匹配消息，但因为被过滤的 seq 不会返回进度，
-   不能单独证明消息不存在。
-4. `Publish` 检查指定 seq；`PublishAutoSeq` 在扫描区间内查找同一事件 ID。
-5. 找到时按成功处理并使用消息 seq；确认不存在后再决定是否重新发布。
-
-服务端对修改和非流式有状态读提供全局线性化顺序：写 RPC 成功返回后才发起的 GetStatus、Fetch
-或其他非流式读 RPC 必须看到该写的完整结果。Subscribe 不属于该顺序，不能用于替代 GetStatus
-和 Fetch 的确定水位对账。
-
 ## 写入和引用对象
 
 高层 client 暴露对象存储方法，发布消息时也可以直接传入 `object_keys`。
@@ -203,8 +177,9 @@ next_seq = response.next_seq
 last_seq = response.last_seq
 ```
 
-`response.messages` 包含 `EventMessage`。传入 `channels=[...]` 时只读取指定 channel；
-省略或传空列表时读取调用方可见的所有 channel。继续读取时，把上一次响应的 `next_seq`
+`response.messages` 包含 `EventMessage`。传入 `channels=[...]` 时，列表中的每个 Channel 都必须存在且
+调用方有读取权限；校验通过后只读取指定 Channel。任一 Channel 校验失败都会拒绝整个请求。省略或传空
+列表时读取调用方可见的所有 Channel。继续读取时，把上一次响应的 `next_seq`
 作为新的 `from_seq`。如果 `next_seq <= last_seq`，继续 Fetch 可能还会扫描到更多已提交消息；
 如果 `next_seq > last_seq`，表示本次响应已经到达当前已提交尾部。
 
@@ -240,10 +215,14 @@ for item in client.subscribe(
         print("next seq:", item.next_seq)
 ```
 
-`from_seq=0` 表示从当前最新位置之后开始等待新消息。传入 `channels=[...]` 时只接收这些 Channel
-中调用方可读的消息；省略或传入空列表时不按 Channel ID 过滤。客户端 timeout 到期时 stream 以
-`DEADLINE_EXCEEDED` 结束。任何中断发生前都应记录已经处理到的 `seq`，之后从 `seq + 1` 重新订阅
+`from_seq=0` 表示从当前最新位置之后开始等待新消息。传入 `channels=[...]` 时，列表中的每个 Channel
+都必须存在且调用方有读取权限；校验通过后只接收这些 Channel 中调用方可读的消息。省略或传入空列表
+时不按 Channel ID 过滤。订阅运行期间显式 Channel 失去读取权限时，stream 返回 `PERMISSION_DENIED` 并
+结束。客户端 timeout 到期时 stream 以 `DEADLINE_EXCEEDED` 结束。任何中断发生前都应记录已经处理到的 `seq`，之后从 `seq + 1` 重新订阅
 或拉取。
+
+服务端开始正常或致命关闭时，会主动结束已经建立的 stream；客户端同样应记录最后处理到的 `seq`，
+之后从 `seq + 1` 重新订阅或拉取。
 
 高层 `OpenEventClient.subscribe` 迭代器会在同一条 stream 内按消息 `seq` 丢弃重复或回退的消息。
 跨连接仍需由调用方持久化最后处理的 `seq`，并从 `seq + 1` 恢复；需要原始 stream 时可以直接

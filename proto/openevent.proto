@@ -104,7 +104,7 @@ message FetchRequest {
     uint64 from_seq = 3;          // Inclusive starting sequence; 0 returns an empty result immediately
     uint32 limit = 4;             // Maximum visible messages to return; required; range 1..1000
     bool only_my_recipient = 5;   // If true, return only messages whose recipients contain principal
-    repeated uint64 channels = 6;  // Return only messages from these channel IDs; empty disables Channel filtering
+    repeated uint64 channels = 6;  // Explicit IDs must exist and be readable; empty disables Channel filtering
 }
 
 message FetchResponse {
@@ -118,7 +118,7 @@ message SubscribeRequest {
     string token = 2;
     uint64 from_seq = 3;          // Starting sequence; 0 starts after the current max_seq
     bool only_my_recipient = 4;   // If true, push only messages whose recipients contain principal
-    repeated uint64 channels = 5; // Push only messages from these channel IDs; empty disables Channel filtering
+    repeated uint64 channels = 5; // Explicit IDs must exist and be readable; empty disables Channel filtering
 }
 
 message SubscribeResponse {

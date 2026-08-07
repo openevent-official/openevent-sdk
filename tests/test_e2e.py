@@ -251,15 +251,25 @@ def test_private_channel_acl_and_member_management(admin: AdminClient, client: O
         )
     _assert_rpc_code(exc_info, grpc.StatusCode.PERMISSION_DENIED)
 
-    outsider_fetch = client.fetch(
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.fetch(
+            principal=outsider,
+            token=outsider_token,
+            from_seq=member_seq,
+            limit=10,
+            channels=[channel_id],
+        )
+    _assert_rpc_code(exc_info, grpc.StatusCode.PERMISSION_DENIED)
+
+    outsider_stream = client.subscribe(
         principal=outsider,
         token=outsider_token,
         from_seq=member_seq,
-        limit=10,
         channels=[channel_id],
     )
-    assert not _messages_by_payload(outsider_fetch.messages, b"member can write")
-    assert outsider_fetch.next_seq > member_seq
+    with pytest.raises(grpc.RpcError) as exc_info:
+        next(outsider_stream)
+    _assert_rpc_code(exc_info, grpc.StatusCode.PERMISSION_DENIED)
 
     client.remove_member(principal=owner, token=owner_token, channel_id=channel_id, target_principal=member)
     with pytest.raises(grpc.RpcError) as exc_info:
@@ -384,6 +394,16 @@ def test_fetch_channel_filter_and_last_seq(admin: AdminClient, client: OpenEvent
         assert response.last_seq >= max_published_seq
         assert response.next_seq > response.last_seq
 
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.fetch(
+            principal=principal,
+            token=token,
+            from_seq=first_seq,
+            limit=1000,
+            channels=[2**64 - 1],
+        )
+    _assert_rpc_code(exc_info, grpc.StatusCode.NOT_FOUND)
+
 
 def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: OpenEventClient) -> None:
     principal = 1401
@@ -472,6 +492,16 @@ def test_subscribe_channel_filter(admin: AdminClient, client: OpenEventClient) -
     assert response.message.seq == selected_seq
     assert response.message.channel_id == selected_channel_id
     assert response.message.payload == b"subscribe selected channel"
+
+    missing_stream = client.subscribe(
+        principal=principal,
+        token=token,
+        from_seq=first_seq,
+        channels=[2**64 - 1],
+    )
+    with pytest.raises(grpc.RpcError) as exc_info:
+        next(missing_stream)
+    _assert_rpc_code(exc_info, grpc.StatusCode.NOT_FOUND)
 
 
 def test_token_delete_changes_authentication(admin: AdminClient, client: OpenEventClient) -> None:
@@ -570,15 +600,15 @@ def test_admin_lists_all_messages_and_ports_are_isolated(
     assert {public_payload, private_payload, recipient_payload}.issubset(collected_payloads)
     assert appended_payload not in collected_payloads
 
-    outsider_fetch = client.fetch(
-        principal=outsider,
-        token=outsider_token,
-        from_seq=private_seq,
-        limit=1000,
-        channels=[private_channel_id],
-    )
-    assert private_payload not in {message.payload for message in outsider_fetch.messages}
-    assert recipient_payload not in {message.payload for message in outsider_fetch.messages}
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.fetch(
+            principal=outsider,
+            token=outsider_token,
+            from_seq=private_seq,
+            limit=1000,
+            channels=[private_channel_id],
+        )
+    _assert_rpc_code(exc_info, grpc.StatusCode.PERMISSION_DENIED)
 
     with pytest.raises(grpc.RpcError) as exc_info:
         admin.list_messages(from_seq=0, limit=0)

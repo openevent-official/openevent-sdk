@@ -12,7 +12,7 @@ Build a wheel from this repository:
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.3-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.4.4-py3-none-any.whl
 ```
 
 For local development, generate protobuf code and use the source tree directly:
@@ -118,41 +118,6 @@ to accommodate the default 16 MiB payload limit and paginated responses. Callers
 that inject a custom channel must configure sufficient
 `grpc.max_send_message_length` and `grpc.max_receive_message_length` values.
 
-### Reconciling an Uncertain Publish Failure
-
-If Publish or PublishAutoSeq ends with a broken connection, cancellation,
-`DEADLINE_EXCEEDED`, or some `UNAVAILABLE` failures, the server may already have
-committed the message. Do not retry immediately: PublishAutoSeq could create a
-duplicate, while Publish may return `ABORTED` because the original seq committed.
-
-Only `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `INVALID_ARGUMENT`,
-`RESOURCE_EXHAUSTED`, and `ABORTED` for Publish seq-CAS conflicts guarantee that
-this publish was not committed. Treat every other non-`OK` status, or the absence
-of a gRPC status, as uncertain. A non-commit guarantee does not imply that the
-cause is recoverable; see section 2.8 of [API.md](API.md) for the full contract.
-
-Recommended flow:
-
-1. Before publishing, record `get_status(...).max_seq` and include a unique event
-   ID in the payload's application protocol.
-2. On an uncertain result, call GetStatus again and record
-   `reconcile_max_seq`. If the original publish committed, this watermark must
-   include it.
-3. Fetch from the previous `max_seq + 1`, following `next_seq` until the scan
-   passes `reconcile_max_seq`. Subscribe can help find a matching message quickly,
-   but cannot by itself prove absence because filtered seq values do not produce
-   progress responses.
-4. For Publish, inspect the requested seq. For PublishAutoSeq, search the scanned
-   range for the same event ID.
-5. If found, treat the operation as successful and use the message seq. Only
-   after confirming it is absent should the application decide whether to publish
-   again.
-
-The server provides one linearized order for mutations and non-streaming stateful
-reads. A GetStatus, Fetch, or other non-streaming read issued after a write RPC
-returned success must observe the complete write. Subscribe is excluded and does
-not replace GetStatus/Fetch for watermark-based reconciliation.
-
 ## Write and Reference Objects
 
 The high-level client exposes object storage methods and accepts `object_keys`
@@ -223,9 +188,11 @@ next_seq = response.next_seq
 last_seq = response.last_seq
 ```
 
-`response.messages` contains `EventMessage` values. Pass `channels=[...]` to
-fetch only selected channels; omit it or pass an empty list to fetch all channels
-visible to the caller. Use the previous response's `next_seq` as the next
+`response.messages` contains `EventMessage` values. When `channels=[...]` is
+provided, every listed Channel must exist and be readable by the caller; any
+failed check rejects the whole request. After validation, only selected channels
+are fetched. Omit it or pass an empty list to fetch all channels visible to the
+caller. Use the previous response's `next_seq` as the next
 `from_seq` to continue reading. If `next_seq <= last_seq`, another fetch may scan
 more committed messages; if `next_seq > last_seq`, the response has reached the
 current committed tail.
@@ -263,10 +230,18 @@ for item in client.subscribe(
 ```
 
 `from_seq=0` means wait for messages published after the subscription is
-established. Pass `channels=[...]` to receive only readable messages from those
-Channels; omit it or pass an empty list to disable Channel filtering. The stream
-ends with `DEADLINE_EXCEEDED` when the client timeout expires. Record the last
-processed `seq` and resume from `seq + 1` after any interruption.
+established. When `channels=[...]` is provided, every listed Channel must exist
+and be readable by the caller; any failed check ends the stream with an error.
+After validation, only readable messages from those Channels are pushed. Omit it
+or pass an empty list to disable Channel filtering. If an explicitly listed
+Channel becomes unreadable while the stream is running, a later batch ends the
+stream with `PERMISSION_DENIED`. The stream ends with `DEADLINE_EXCEEDED` when
+the client timeout expires. Record the last processed `seq` and resume from
+`seq + 1` after any interruption.
+
+When the server begins normal or fatal shutdown, it actively ends every
+established stream. Treat this like any other interruption: record the last
+processed `seq` and resume from `seq + 1` using Subscribe or Fetch.
 
 The high-level `OpenEventClient.subscribe` iterator suppresses repeated or
 backward message `seq` values within one stream. Persist the last processed `seq`

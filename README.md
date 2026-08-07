@@ -60,7 +60,7 @@ make build
 The wheel is written to:
 
 ```text
-dist/openevent_sdk-0.4.3-py3-none-any.whl
+dist/openevent_sdk-0.4.4-py3-none-any.whl
 ```
 
 Build and install the generated wheel:
@@ -90,7 +90,7 @@ Run end-to-end tests against a real OpenEvent server:
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-End-to-end tests use the `openevent-sdk>=0.4.3` package already installed in
+End-to-end tests use the `openevent-sdk>=0.4.4` package already installed in
 the current Python environment. They do not install this repository into a
 temporary dependency directory or generate SDK protobuf files.
 

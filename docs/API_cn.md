@@ -2,7 +2,7 @@
 
 [English version](API.md)
 
-> 版本: 0.4.3
+> 版本: 0.4.4
 > 日期: 2026-08-05
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
@@ -112,7 +112,7 @@
   的修改和非流式读取按服务端全局顺序观察提交前或提交后的完整状态，不能观察部分提交。
 - Subscribe 与并发 RPC 之间没有顺序点，但每批会等待共享 snapshot 覆盖该批开始前已完成的提交；
   这些提交最晚在下一次成功的 100 ms snapshot 刷新后可见。Subscribe 不提供固定水位，需要固定
-  水位读取或对账时使用 GetStatus 和 Fetch。
+  水位读取时使用 GetStatus 和 Fetch。
 
 ### 2.8 发布结果不确定时的处理
 
@@ -142,27 +142,6 @@
 
 上表只适用于由兼容 OpenEvent 服务端产生的终态。如果代理、负载均衡器或客户端本地可能在请求已
 转发后合成同名 status，且部署无法证明该 status 发生在转发前，仍必须按结果不确定处理。
-
-调用方不得直接重试结果不确定的发布，而应：
-
-1. 发布前记录当前 `max_seq`，并保留本次请求的 `channel_id`、principal、recipients 和 payload；
-   建议在 payload 的业务协议中携带唯一事件 ID。
-2. 失败后先调用 GetStatus，记录用于对账的 `reconcile_max_seq`。由于该读排在先前发布之后，若发布
-   已提交，该水位必须包含它。
-3. 从发布前记录的 `max_seq+1` 开始 Fetch，持续使用 `next_seq` 扫描到超过
-   `reconcile_max_seq`。Subscribe 可以用于尽快发现匹配消息，但由于过滤掉的 seq 不产生进度响应，
-   不能单独用于证明消息不存在。
-4. `Publish` 可优先检查请求中指定的 seq；`PublishAutoSeq` 在上述区间内按唯一事件 ID 或完整请求
-   内容检查是否已经写入。
-5. 找到匹配消息时按成功处理并使用其 seq；确认未找到后，调用方才可以根据业务策略发起新的
-   发布请求。
-
-如果应用可能并发发布内容完全相同的消息，单靠 payload 等字段不能可靠区分调用，必须在业务
-payload 中加入唯一事件 ID。
-
-对账读取必须使用仍然有效且有权读取目标 Channel 的身份，并确保 channels/recipient 过滤不会
-排除候选消息。如果 token 已失效或 Channel 读取权限已被撤销，业务 Fetch 无法证明发布结果，
-需要通过仍有权限的身份或受保护的管理查询完成对账。
 
 ## 3. EventService
 
@@ -223,7 +202,9 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 
 - token 与 principal 匹配。
 - limit 必须在 `1..1000`。
-- channels 为空表示不过滤；非空时只返回这些 Channel 中调用方可读的消息。
+- channels 为空表示不过滤；非空时，列表中的每个 Channel 都必须存在且调用方有读取权限，否则整个
+  请求返回错误；不存在返回 `NOT_FOUND`，不可读返回 `PERMISSION_DENIED`。校验通过后只返回这些 Channel
+  中调用方可读的消息。
 - `only_my_recipient=true` 时应用 recipient 过滤。
 
 | `from_seq` | 行为 |
@@ -234,7 +215,8 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 
 响应语义：
 
-- messages 最多包含 limit 条经过 ACL、channels 和 recipient 过滤的消息。
+- messages 最多包含 limit 条经过 ACL、channels 和 recipient 过滤的消息。显式 channels 的完整权限校验在
+  扫描前完成，任一 Channel 校验失败都不会返回部分结果。
 - 服务端可以因扫描预算或响应大小预算提前结束一页，因此 messages 可能少于 limit，甚至在大量
   不可见消息时为空；调用方必须使用返回的 `next_seq` 继续，不能把短页当作尾部。
 - 单条可返回消息可以突破页面软大小预算，但仍受 gRPC 传输硬上限约束；服务端不会因软预算在同一
@@ -243,6 +225,7 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 - `last_seq` 是本次响应观察到的最大已提交消息序号。
 - `next_seq <= last_seq` 时可以继续 Fetch；`next_seq > last_seq` 表示到达本次观察到的尾部。
 - ACL 或过滤不会让 next_seq 回退。
+- 扫描到消息所属 Channel 不存在时返回 `INTERNAL`；这不视为持久化存储损坏，也不使服务端退出。
 
 ### 3.5 Subscribe
 
@@ -256,10 +239,15 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 - Subscribe 不进入非流式读写的全局线性化顺序，与并发 RPC 之间没有线性化点。订阅读取使用服务端
   每 100 ms 在成功提交后刷新的全局共享 snapshot；每批会等待该 snapshot 覆盖批次开始前已完成的
   提交。
-- `channels` 为空时不按 Channel ID 过滤；非空时只推送所列 Channel 中调用方可读的消息。
+- `channels` 为空时不按 Channel ID 过滤；非空时，列表中的每个 Channel 都必须存在且调用方有读取权限，
+  否则整个 stream 返回错误；不存在返回 `NOT_FOUND`，不可读返回 `PERMISSION_DENIED`。校验通过后只推送
+  所列 Channel 中调用方可读的消息。
 - `only_my_recipient=true` 时应用 recipient 过滤。
-- 被 Channel ACL、channels 或 recipient 过滤的记录不产生响应，但服务端扫描会消费这些记录并继续
-  向后处理。
+- 校验通过后，被 Channel ACL、channels 或 recipient 过滤的记录不产生响应，但服务端扫描会消费这些记录并
+  继续向后处理。订阅运行期间如果显式 Channel 的读取权限失效，后续批次返回 `PERMISSION_DENIED` 并结束
+  stream。
+- 扫描到消息所属 Channel 不存在时，stream 返回 `INTERNAL` 并结束；这不视为持久化存储损坏，也不使服务端
+  退出。
 
 | `from_seq` | 行为 |
 |------------|------|
@@ -269,6 +257,9 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 
 `SubscribeResponse.message` 表示正常消息；`next_seq` 只用于 `from_seq > max_seq`。客户端取消或
 断开后应记录最后已处理 seq，并从 `seq+1` 重新订阅或 Fetch。
+
+服务端开始正常或致命关闭时，会主动结束已经建立的 Subscribe stream；客户端应按其他 stream 中断
+处理，记录最后已处理的 seq，并从 `seq+1` 继续订阅或 Fetch。
 
 ## 4. ObjectStorageService
 
@@ -425,6 +416,7 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
   跳过。
 - next_seq 是下一页建议起点。
 - last_seq 是查询开始时的最大已提交消息序号。
+- 扫描到消息所属 Channel 不存在时返回 `INTERNAL`；这不视为持久化存储损坏，也不使服务端退出。
 - 起点超过尾部时返回空页和尾部下一位置；`next_seq > last_seq` 表示到达本页观察到的尾部。
 - 每页是一致视图，但并发追加可使后续页的 last_seq 增大。
 
