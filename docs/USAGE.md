@@ -12,7 +12,7 @@ Build a wheel from this repository:
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.4-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.6.0-py3-none-any.whl
 ```
 
 For local development, generate protobuf code and use the source tree directly:
@@ -79,16 +79,19 @@ Visibility:
 
 ## Publish Messages
 
-The simplest method is to let the server assign a global `seq`:
+Get one UUID from the SDK before each logical publish. The SDK maintains and refills its in-memory pool internally.
+The simplest publish lets the server assign the global `seq`:
 
 ```python
 payload = "hello OpenEvent".encode("utf-8")
+uuid = client.get_uuid()
 
 result = client.publish_auto_seq(
     principal=principal,
     token=token,
     channel_id=channel_id,
     payload=payload,
+    uuid=uuid,
 )
 
 print(result.seq)
@@ -100,6 +103,7 @@ If the client needs CAS-style publishing, query status first and then call
 ```python
 status = client.get_status(principal, token)
 next_seq = status.max_seq + 1
+uuid = client.get_uuid()
 
 client.publish(
     principal=principal,
@@ -107,11 +111,29 @@ client.publish(
     channel_id=channel_id,
     seq=next_seq,
     payload=b"message with expected seq",
+    uuid=uuid,
 )
 ```
 
 `payload` is an opaque byte array. You can encode it as JSON, MessagePack,
 custom binary, or plain text.
+
+For an uncertain Publish result, retain the UUID and follow the recovery procedure in API contract section 2.9. The
+final duplicate-UUID step obtains the committed sequence without fetching history:
+
+```python
+import grpc
+
+try:
+    client.publish_auto_seq(principal, token, channel_id, payload, uuid=uuid)
+except grpc.RpcError as exc:
+    if exc.code() != grpc.StatusCode.ALREADY_EXISTS:
+        raise
+    committed_seq = client.get_seq_by_uuid(uuid)
+```
+
+`get_seq_by_uuid()` returns the sequence for a UUID consumed by a committed message. Its protocol behavior is defined
+in API contract section 3.3.
 
 SDK-created gRPC channels set the per-message send and receive limits to 64 MiB
 to accommodate the default 16 MiB payload limit and paginated responses. Callers
@@ -145,6 +167,7 @@ published = client.publish_auto_seq(
     channel_id=channel_id,
     payload=b"report ready",
     object_keys=[key],
+    uuid=client.get_uuid(),
 )
 ```
 
@@ -167,7 +190,7 @@ chunk = client.read_object(
 Objects are immutable, nonempty, and limited to 4 MiB. ObjectKeys are permanent,
 transferable bearer credentials; attaching one to a message discloses it to every
 caller that can read that message, including administrative readers. Do not log
-object tokens. See sections 2.6 and 4 of [API.md](API.md) for exact limits, range
+object tokens. See sections 2.7 and 4 of [API.md](API.md) for exact limits, range
 behavior, errors, and uncertain WriteObject results.
 
 ## Fetch Messages
@@ -259,6 +282,7 @@ client.publish_auto_seq(
     channel_id=channel_id,
     recipients=[1002, 1003],
     payload=b"private note for selected members",
+    uuid=client.get_uuid(),
 )
 ```
 
@@ -315,7 +339,7 @@ and branch on the status code:
 import grpc
 
 try:
-    client.publish_auto_seq(principal, token, channel_id, b"hello")
+    client.publish_auto_seq(principal, token, channel_id, b"hello", uuid=client.get_uuid())
 except grpc.RpcError as exc:
     if exc.code() == grpc.StatusCode.UNAUTHENTICATED:
         print("invalid token")

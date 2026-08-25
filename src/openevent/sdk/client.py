@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from numbers import Real
+from threading import Lock
 from typing import Iterable, Optional
 
 import grpc
@@ -16,6 +18,7 @@ except ImportError as exc:  # pragma: no cover
 
 _DEFAULT_MAX_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024
 _DEFAULT_RPC_TIMEOUT_SECONDS = 30.0
+_UUID_POOL_BATCH_SIZE = 1024
 _DEFAULT_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
     ("grpc.max_receive_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
@@ -62,6 +65,8 @@ class OpenEventClient:
     ):
         self._closed = True
         self._owns_channel = channel is None
+        self._uuid_pool = deque()
+        self._uuid_pool_lock = Lock()
         self.timeout = timeout
         self.channel = (
             grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
@@ -111,6 +116,25 @@ class OpenEventClient:
             timeout=self.timeout,
         )
 
+    def get_uuid(self) -> int:
+        with self._uuid_pool_lock:
+            if not self._uuid_pool:
+                response = self.event_stub.AllocateUuids(
+                    openevent_pb2.AllocateUuidsRequest(count=_UUID_POOL_BATCH_SIZE),
+                    timeout=self.timeout,
+                )
+                if len(response.uuids) != _UUID_POOL_BATCH_SIZE:
+                    raise RuntimeError("server returned an incomplete UUID allocation batch")
+                self._uuid_pool.extend(response.uuids)
+            return self._uuid_pool.popleft()
+
+    def get_seq_by_uuid(self, uuid: int) -> int:
+        response = self.event_stub.GetSeqByUuid(
+            openevent_pb2.GetSeqByUuidRequest(uuid=uuid),
+            timeout=self.timeout,
+        )
+        return response.seq
+
     def publish(
         self,
         principal: int,
@@ -118,6 +142,7 @@ class OpenEventClient:
         channel_id: int,
         seq: int,
         payload: bytes,
+        uuid: int,
         recipients: Iterable[int] = (),
         object_keys: Iterable[openevent_pb2.ObjectKey] = (),
     ):
@@ -130,6 +155,7 @@ class OpenEventClient:
                 recipients=list(recipients),
                 payload=payload,
                 object_keys=list(object_keys),
+                uuid=uuid,
             ),
             timeout=self.timeout,
         )
@@ -140,6 +166,7 @@ class OpenEventClient:
         token: str,
         channel_id: int,
         payload: bytes,
+        uuid: int,
         recipients: Iterable[int] = (),
         object_keys: Iterable[openevent_pb2.ObjectKey] = (),
     ):
@@ -151,6 +178,7 @@ class OpenEventClient:
                 recipients=list(recipients),
                 payload=payload,
                 object_keys=list(object_keys),
+                uuid=uuid,
             ),
             timeout=self.timeout,
         )

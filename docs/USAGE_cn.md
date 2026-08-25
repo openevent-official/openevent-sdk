@@ -11,7 +11,7 @@
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.4.4-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.6.0-py3-none-any.whl
 ```
 
 开发本仓库时，可以直接生成 protobuf 代码并使用源码：
@@ -73,16 +73,18 @@ channel_id = created.channel.channel_id
 
 ## 发布消息
 
-最简单的方式是让服务端分配全局 `seq`：
+每次逻辑发布前从 SDK 取出一个 UUID。SDK 在内部维护并补充内存 UUID 池。最简单的方式是让服务端分配全局 `seq`：
 
 ```python
 payload = "hello OpenEvent".encode("utf-8")
+uuid = client.get_uuid()
 
 result = client.publish_auto_seq(
     principal=principal,
     token=token,
     channel_id=channel_id,
     payload=payload,
+    uuid=uuid,
 )
 
 print(result.seq)
@@ -93,6 +95,7 @@ print(result.seq)
 ```python
 status = client.get_status(principal, token)
 next_seq = status.max_seq + 1
+uuid = client.get_uuid()
 
 client.publish(
     principal=principal,
@@ -100,11 +103,27 @@ client.publish(
     channel_id=channel_id,
     seq=next_seq,
     payload=b"message with expected seq",
+    uuid=uuid,
 )
 ```
 
 `payload` 是不透明字节数组，SDK 不解析内容。你可以自行使用 JSON、MessagePack、
 自定义二进制协议或普通文本。
+
+发布结果不确定时，保留 UUID 并按 API 契约 2.9 节的恢复流程处理。最终的重复 UUID 步骤可以无需拉取历史消息即取得已提交 seq：
+
+```python
+import grpc
+
+try:
+    client.publish_auto_seq(principal, token, channel_id, payload, uuid=uuid)
+except grpc.RpcError as exc:
+    if exc.code() != grpc.StatusCode.ALREADY_EXISTS:
+        raise
+    committed_seq = client.get_seq_by_uuid(uuid)
+```
+
+`get_seq_by_uuid()` 返回已被 committed 消息消费的 UUID 所对应的 seq。其协议行为以 API 契约 3.3 节为准。
 
 SDK 自建的 gRPC channel 默认把单条收发消息上限设为 64 MiB，以容纳默认 16 MiB payload 和分页
 响应。调用方注入自定义 channel 时必须自行设置足够的 `grpc.max_send_message_length` 和
@@ -136,6 +155,7 @@ published = client.publish_auto_seq(
     channel_id=channel_id,
     payload=b"report ready",
     object_keys=[key],
+    uuid=client.get_uuid(),
 )
 ```
 
@@ -157,7 +177,7 @@ chunk = client.read_object(
 
 对象不可变、不能为空且最大 4 MiB。ObjectKey 是永久、可转交的 bearer credential；把它附加到
 消息会向所有能读取该消息的调用方披露 capability，包括管理端读取者。禁止记录对象 token。
-精确限制、范围规则、错误和 WriteObject 结果不确定语义见 [API_cn.md](API_cn.md) 的 2.6 和 4 节。
+精确限制、范围规则、错误和 WriteObject 结果不确定语义见 [API_cn.md](API_cn.md) 的 2.7 和 4 节。
 
 ## 拉取消息
 
@@ -239,6 +259,7 @@ client.publish_auto_seq(
     channel_id=channel_id,
     recipients=[1002, 1003],
     payload=b"private note for selected members",
+    uuid=client.get_uuid(),
 )
 ```
 
@@ -288,7 +309,7 @@ SDK 直接暴露 gRPC 调用错误。调用方应捕获 `grpc.RpcError` 并根�
 import grpc
 
 try:
-    client.publish_auto_seq(principal, token, channel_id, b"hello")
+    client.publish_auto_seq(principal, token, channel_id, b"hello", uuid=client.get_uuid())
 except grpc.RpcError as exc:
     if exc.code() == grpc.StatusCode.UNAUTHENTICATED:
         print("invalid token")

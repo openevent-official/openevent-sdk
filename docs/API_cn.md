@@ -2,8 +2,8 @@
 
 [English version](API.md)
 
-> 版本: 0.4.4
-> 日期: 2026-08-05
+> 版本: 0.6.0
+> 日期: 2026-08-21
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
 [`proto/admin.proto`](../proto/admin.proto) 的公开 API 行为。它不描述服务端存储、恢复、部署
@@ -12,11 +12,10 @@
 ## 1. 基础约定
 
 - 所有接口通过 `gRPC + Protocol Buffers` 提供。
-- Event、Channel 和对象写入请求携带 `principal + token`；对象读取使用
-  `object_id + object_token`，`AdminService` 两者都不携带。
 - 客户端只依赖 `seq` 作为全局消息位置，不维护独立消息存储 offset。
 - `seq` 单调递增且已提交值不复用；客户端不得依赖序号相邻。
 - 每条 `EventMessage` 包含 `ts_ms`，表示服务端收到发布请求时的 Unix 毫秒时间戳。
+- 每条 `EventMessage` 都包含由 `AllocateUuids` 分配的非 0 `uuid`。
 - `payload` 是不透明 bytes，OpenEvent 不解析或校验业务 schema。
 - OpenEvent 保留全部已提交历史消息、Channel metadata 和不可变对象。
 
@@ -38,7 +37,7 @@
 | `UNAUTHENTICATED` | token 缺失、无效，或与 `principal` 不匹配 |
 | `PERMISSION_DENIED` | ACL 检查失败，或调用方无权执行操作 |
 | `NOT_FOUND` | Channel 不存在，或对象 capability 不存在/无效 |
-| `ALREADY_EXISTS` | 重复添加成员等资源已存在场景 |
+| `ALREADY_EXISTS` | 资源已存在，例如重复添加成员或 UUID 已被消息使用 |
 | `INVALID_ARGUMENT` | 字段缺失、值非法，或 recipients 不满足成员约束 |
 | `RESOURCE_EXHAUSTED` | payload 超过上限，或对象存储空间/quota 不足 |
 | `OUT_OF_RANGE` | ReadObject offset 大于对象大小 |
@@ -62,7 +61,19 @@
 - 大小上限由部署实例决定；参考实现默认 16 MiB。
 - 超限返回 `RESOURCE_EXHAUSTED`，不产生新消息。
 
-### 2.4 Channel ACL
+### 2.4 消息 UUID
+
+- UUID 0 为保留值。
+- 每个 Publish 和 PublishAutoSeq 请求都必须携带一个由 AllocateUuids 返回的非 0 UUID。
+- UUID 为 0 或并非由服务端分配时返回 `INVALID_ARGUMENT`；UUID 已被 committed 消息消费时返回
+  `ALREADY_EXISTS`。这两种情况都不创建消息，也不推进 `max_seq`。
+- 认证成功后，已被消费的 UUID 必须先于 payload、ObjectKey、Channel、ACL 和 Publish seq-CAS 校验返回
+  `ALREADY_EXISTS`。重复处理不比较任何这些请求字段；一个 UUID 最多消费一条消息。
+- Python 高层 client 只通过 `get_uuid()` 逐个提供 UUID；其内部池行为见使用指南。生成式 gRPC stub 按协议提供
+  AllocateUuids。
+- 分配与查询 RPC 分别以 3.2 和 3.3 节为准。发布结果不确定时的完整恢复流程只以 2.9 节为准。
+
+### 2.5 Channel ACL
 
 | 可见性 | 读取权限 | 写入权限 |
 |--------|----------|----------|
@@ -77,14 +88,14 @@
 - 返回固定 `ChannelInfo`：`channel_id=0`、`VISIBILITY_PROTECTED`、无 creator、空 members。
 - 不允许发布消息或修改成员。
 
-### 2.5 Recipients
+### 2.6 Recipients
 
 - `recipients` 是消息的定向接收 principal 列表；空列表表示无定向接收方。
 - 发布时每个 recipient 都必须是对应 Channel 成员，否则返回 `INVALID_ARGUMENT`。
 - `only_my_recipient=true` 时只返回或推送 recipients 包含当前 principal 的消息；空 recipients
   不匹配该过滤条件。
 
-### 2.6 对象 Capability 与消息引用
+### 2.7 对象 Capability 与消息引用
 
 - `ObjectKey` 由 `object_id + object_token` 组成，是永久 bearer capability。任何同时持有两者的
   调用方都能读取对象 metadata 和 data，不需要 principal token 或 Channel 权限。
@@ -97,7 +108,7 @@
 - Fetch、Subscribe 和管理端 ListMessages 返回完整 ObjectKey；任何有权读取消息的调用方都会取得
   消息中的全部 capability。
 
-### 2.7 读写线性化与提交顺序
+### 2.8 读写线性化与提交顺序
 
 - 所有修改和非流式有状态业务/管理读 RPC 具有一个服务端全局顺序。写请求在该顺序中提交，
   非流式读请求在自己的顺序位置取得一致 snapshot。Subscribe 不属于该全局顺序。
@@ -114,11 +125,13 @@
   这些提交最晚在下一次成功的 100 ms snapshot 刷新后可见。Subscribe 不提供固定水位，需要固定
   水位读取时使用 GetStatus 和 Fetch。
 
-### 2.8 发布结果不确定时的处理
+### 2.9 发布结果不确定时的处理
 
 如果 `Publish` 或 `PublishAutoSeq` 没有返回成功响应，不能仅凭客户端看到的错误判断消息一定没有
 提交。连接中断、客户端取消、`DEADLINE_EXCEEDED`、部分 `UNAVAILABLE` 等失败可能发生在服务端
-已经开始或完成持久化之后。
+已经开始或完成持久化之后。必须保留该调用使用的 UUID，并用同一 UUID 重试 Publish 或 PublishAutoSeq；重试返回
+`ALREADY_EXISTS` 时，用该 UUID 调用 `GetSeqByUuid` 取得原 committed 消息的 seq，不扫描消息或 UUID 历史。
+使用新 UUID 是新的发布尝试。
 
 对于兼容本契约的 OpenEvent 服务端，发布 RPC 的终态按下表判断。“保证未提交”表示本请求没有创建
 `EventMessage`，也没有因本请求推进 `max_seq`；它只针对返回该状态的这一次 RPC，不证明此前同一
@@ -133,6 +146,7 @@
 | `INVALID_ARGUMENT` | 保证未提交 |
 | `RESOURCE_EXHAUSTED` | 保证未提交 |
 | `ABORTED` | 保证未提交；仅适用于 `Publish` 的 seq CAS 冲突，`PublishAutoSeq` 不应返回 |
+| `ALREADY_EXISTS` | 保证未提交；UUID 已被此前 committed 消息使用 |
 | 其他任何非 `OK` 返回或没有 gRPC status | 结果不确定 |
 
 因此 `CANCELLED`、`DEADLINE_EXCEEDED`、`UNKNOWN`、`UNAVAILABLE`、`INTERNAL`、连接中断、代理重置
@@ -157,7 +171,27 @@ rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 客户端可以把 `max_seq+1` 作为下一次 Publish 的候选 seq。并发发布先占用该值时，Publish 返回
 `ABORTED`。
 
-### 3.2 Publish
+### 3.2 AllocateUuids
+
+```protobuf
+rpc AllocateUuids(AllocateUuidsRequest) returns (AllocateUuidsResponse);
+```
+
+请求只包含必须位于 `1..1024` 的 `count`。响应恰好包含 count 个全局单调递增且连续的 UUID，按递增顺序
+返回。分配不认证，也不创建消息。成功调用会持久化推进分配水位；即使没有消息消费，已分配 UUID 也不会重复使用。仅分配不会使 UUID
+可被 GetSeqByUuid 查到。
+
+### 3.3 GetSeqByUuid
+
+```protobuf
+rpc GetSeqByUuid(GetSeqByUuidRequest) returns (GetSeqByUuidResponse);
+```
+
+请求只包含 `uuid`，不携带 `principal` 或 `token`。该不认证读取不改变分配或消息状态。UUID 为 0 返回
+`INVALID_ARGUMENT`。除非 UUID 已被 committed 消息消费，否则返回 `NOT_FOUND`；未分配 UUID 和已分配但未使用 UUID 均属于此情况。
+成功时 `seq` 是消费该 UUID 的 committed 消息序号。
+
+### 3.4 Publish
 
 ```protobuf
 rpc Publish(PublishRequest) returns (PublishResponse);
@@ -169,8 +203,10 @@ rpc Publish(PublishRequest) returns (PublishResponse);
 - payload 未超过上限。
 - `seq == 当前 max_seq + 1`。
 - Channel 存在且调用方有写权限。
-- recipients 满足 2.5。
-- object_keys 满足 2.6。
+- recipients 满足 2.6。
+- object_keys 满足 2.7。
+
+UUID 校验、重复优先顺序和恢复规则以 2.4 和 2.9 节为准。
 
 | 条件 | 返回 |
 |------|------|
@@ -184,15 +220,16 @@ rpc Publish(PublishRequest) returns (PublishResponse);
 
 成功返回空响应。服务端生成 `ts_ms`，消息随后可被有权限的调用方读取或订阅。
 
-### 3.3 PublishAutoSeq
+### 3.5 PublishAutoSeq
 
 ```protobuf
 rpc PublishAutoSeq(PublishAutoSeqRequest) returns (PublishAutoSeqResponse);
 ```
 
-成功条件与 Publish 相同，但 seq 由服务端分配。响应中的 seq 是已提交消息序号。
+成功条件与 Publish 相同，但 seq 由服务端分配。UUID 校验、重复优先顺序和恢复规则以 2.4 和 2.9 节为准。
+响应中的 seq 是已提交消息序号。
 
-### 3.4 Fetch
+### 3.6 Fetch
 
 ```protobuf
 rpc Fetch(FetchRequest) returns (FetchResponse);
@@ -227,7 +264,7 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 - ACL 或过滤不会让 next_seq 回退。
 - 扫描到消息所属 Channel 不存在时返回 `INTERNAL`；这不视为持久化存储损坏，也不使服务端退出。
 
-### 3.5 Subscribe
+### 3.7 Subscribe
 
 ```protobuf
 rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
@@ -340,7 +377,7 @@ rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
 rpc GetChannel(GetChannelRequest) returns (GetChannelResponse);
 ```
 
-- 读取权限见 2.4。
+- 读取权限见 2.5。
 - Channel 不存在返回 `NOT_FOUND`。
 - 无读取权限返回 `PERMISSION_DENIED`。
 

@@ -38,6 +38,7 @@ message EventMessage {
     repeated uint64 recipients = 5;  // Recipient principal list
     bytes payload = 6;
     repeated ObjectKey object_keys = 7;  // Object capability references attached to this message
+    uint64 uuid = 8;               // Server-allocated message deduplication UUID; 0 is invalid
 }
 
 message ChannelInfo {
@@ -56,10 +57,28 @@ message ChannelInfo {
 
 service EventService {
     rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+    rpc AllocateUuids(AllocateUuidsRequest) returns (AllocateUuidsResponse);
+    rpc GetSeqByUuid(GetSeqByUuidRequest) returns (GetSeqByUuidResponse);
     rpc Publish(PublishRequest) returns (PublishResponse);
     rpc PublishAutoSeq(PublishAutoSeqRequest) returns (PublishAutoSeqResponse);
     rpc Fetch(FetchRequest) returns (FetchResponse);
     rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+}
+
+message AllocateUuidsRequest {
+    uint32 count = 1;              // Number of UUIDs to allocate; range 1..1024
+}
+
+message AllocateUuidsResponse {
+    repeated uint64 uuids = 1;     // Globally monotonic UUIDs allocated by the server
+}
+
+message GetSeqByUuidRequest {
+    uint64 uuid = 1;               // UUID previously allocated by AllocateUuids
+}
+
+message GetSeqByUuidResponse {
+    uint64 seq = 1;                // Committed message sequence that consumed uuid
 }
 
 message GetStatusRequest {
@@ -80,6 +99,7 @@ message PublishRequest {
     repeated uint64 recipients = 5;  // Recipient principal list
     bytes payload = 6;
     repeated ObjectKey object_keys = 7;  // Object capability references to attach to the message
+    uint64 uuid = 8;               // UUID previously allocated by AllocateUuids
 }
 
 message PublishResponse {
@@ -92,6 +112,7 @@ message PublishAutoSeqRequest {
     repeated uint64 recipients = 4;  // Recipient principal list
     bytes payload = 5;
     repeated ObjectKey object_keys = 6;  // Object capability references to attach to the message
+    uint64 uuid = 7;               // UUID previously allocated by AllocateUuids
 }
 
 message PublishAutoSeqResponse {

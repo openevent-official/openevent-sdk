@@ -2,8 +2,8 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.4.4
-> Date: 2026-08-05
+> Version: 0.6.0
+> Date: 2026-08-21
 
 This document defines the public behavior of the business protocol
 [`proto/openevent.proto`](../proto/openevent.proto) and management protocol
@@ -13,14 +13,13 @@ recovery, deployment topology, or internal execution mechanisms.
 ## 1. Basic Conventions
 
 - All APIs use `gRPC + Protocol Buffers`.
-- Event, Channel, and object-write requests carry `principal + token`.
-  Object reads use `object_id + object_token`; `AdminService` carries neither.
 - Clients use `seq` as the global message position and do not maintain a separate
   message-storage offset.
 - Committed `seq` values increase monotonically and are not reused. Clients must
   not depend on adjacency.
 - Each `EventMessage` contains `ts_ms`, the Unix millisecond timestamp when the
   server received the publish request.
+- Each `EventMessage` contains a nonzero `uuid` allocated by `AllocateUuids`.
 - `payload` is opaque bytes; OpenEvent does not parse or validate its business schema.
 - OpenEvent retains all committed messages, Channel metadata, and immutable objects.
 
@@ -42,7 +41,7 @@ recovery, deployment topology, or internal execution mechanisms.
 | `UNAUTHENTICATED` | token is missing, invalid, or not bound to `principal` |
 | `PERMISSION_DENIED` | ACL check failed or the operation is not allowed |
 | `NOT_FOUND` | Channel does not exist, or an object capability is absent or invalid |
-| `ALREADY_EXISTS` | Resource already exists, such as an existing member |
+| `ALREADY_EXISTS` | Resource already exists, such as an existing member or a UUID already used by a message |
 | `INVALID_ARGUMENT` | Missing/invalid fields or invalid recipients |
 | `RESOURCE_EXHAUSTED` | payload exceeds its limit or object storage has insufficient space/quota |
 | `OUT_OF_RANGE` | ReadObject offset is greater than the object size |
@@ -68,7 +67,21 @@ recovery, deployment topology, or internal execution mechanisms.
 - The size limit is deployment-specific; the reference default is 16 MiB.
 - Oversized payload returns `RESOURCE_EXHAUSTED` and creates no message.
 
-### 2.4 Channel ACL
+### 2.4 Message UUIDs
+
+- UUID 0 is reserved.
+- Every Publish and PublishAutoSeq request must carry one nonzero UUID returned by AllocateUuids.
+- UUID 0 or a UUID not allocated by the server returns `INVALID_ARGUMENT`. A UUID already consumed by a committed
+  message returns `ALREADY_EXISTS`. Neither result creates a message or advances `max_seq`.
+- After authentication, a consumed UUID returns `ALREADY_EXISTS` before payload, ObjectKey, Channel, ACL, or
+  Publish seq-CAS validation. Duplicate handling does not compare any of those request fields; a UUID can consume
+  at most one message.
+- The Python high-level client exposes one UUID at a time through `get_uuid()`; its pool behavior is described in
+  the usage guide. The generated gRPC stub exposes AllocateUuids as part of the protocol.
+- The allocation and lookup RPCs are defined in sections 3.2 and 3.3. The complete recovery procedure for an
+  uncertain publish result is defined only in section 2.9.
+
+### 2.5 Channel ACL
 
 | Visibility | Read Permission | Write Permission |
 |------------|-----------------|------------------|
@@ -83,7 +96,7 @@ System channel `channel_id=0`:
 - Returns fixed ChannelInfo with protected visibility, no creator, and no members.
 - Does not allow publishing or member changes.
 
-### 2.5 Recipients
+### 2.6 Recipients
 
 - recipients is the targeted principal list; an empty list means no targets.
 - Every recipient must be a Channel member when publishing, otherwise the server
@@ -91,7 +104,7 @@ System channel `channel_id=0`:
 - With `only_my_recipient=true`, only messages targeting the current principal
   are returned or pushed; messages with empty recipients do not match.
 
-### 2.6 Object Capabilities and Message References
+### 2.7 Object Capabilities and Message References
 
 - `ObjectKey` contains `object_id + object_token` and is a permanent bearer
   capability. Anyone holding both values can read the object's metadata and data
@@ -108,7 +121,7 @@ System channel `channel_id=0`:
 - Fetch, Subscribe, and administrative ListMessages return complete ObjectKeys.
   Any caller allowed to read a message therefore receives every capability in it.
 
-### 2.7 Read/Write Linearization and Commit Ordering
+### 2.8 Read/Write Linearization and Commit Ordering
 
 - All mutations and non-streaming stateful business/administrative reads have one
   server-side global order. Writes commit in that order, while non-streaming reads
@@ -132,12 +145,15 @@ System channel `channel_id=0`:
   does not provide a stable watermark. Use GetStatus and Fetch for fixed-watermark
   reads.
 
-### 2.8 Handling an Uncertain Publish Result
+### 2.9 Handling an Uncertain Publish Result
 
 When Publish or PublishAutoSeq does not return a successful response, the client
 cannot always conclude that the message was not committed. A broken connection,
 client cancellation, `DEADLINE_EXCEEDED`, and some `UNAVAILABLE` failures may
-occur after the server started or completed persistence.
+occur after the server started or completed persistence. Retain the UUID supplied
+to that call. Retry the same Publish or PublishAutoSeq with that UUID. If the retry returns `ALREADY_EXISTS`, call
+`GetSeqByUuid` with the UUID to obtain the original committed seq; do not scan messages or UUIDs to reconcile this
+result. Retrying with a new UUID is a new publish attempt.
 
 For an OpenEvent server conforming to this contract, classify the terminal
 publish status as follows. A non-commit guarantee means that this request did not
@@ -154,6 +170,7 @@ committed, and does not mean that the cause is recoverable.
 | `INVALID_ARGUMENT` | Guaranteed not committed |
 | `RESOURCE_EXHAUSTED` | Guaranteed not committed |
 | `ABORTED` | Guaranteed not committed; only for Publish seq-CAS conflicts and not expected from PublishAutoSeq |
+| `ALREADY_EXISTS` | Guaranteed not committed; the UUID was already used by an earlier committed message |
 | Any other non-`OK` status, or no gRPC status | Uncertain outcome |
 
 Therefore `CANCELLED`, `DEADLINE_EXCEEDED`, `UNKNOWN`, `UNAVAILABLE`,
@@ -183,7 +200,29 @@ rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 Clients may use `max_seq+1` as the next Publish candidate. A concurrent publish
 can consume it first, causing `ABORTED`.
 
-### 3.2 Publish
+### 3.2 AllocateUuids
+
+```protobuf
+rpc AllocateUuids(AllocateUuidsRequest) returns (AllocateUuidsResponse);
+```
+
+The request contains only `count`, which must be in `1..1024`. The response contains exactly `count` globally
+monotonically increasing, contiguous UUIDs in increasing order. Allocation is unauthenticated and does not create a
+message. A successful call durably advances the allocation watermark; allocated UUIDs are never reused, including
+when no message consumes them. Allocation alone does not make a UUID queryable through GetSeqByUuid.
+
+### 3.3 GetSeqByUuid
+
+```protobuf
+rpc GetSeqByUuid(GetSeqByUuidRequest) returns (GetSeqByUuidResponse);
+```
+
+The request contains only `uuid`; it carries no `principal` or `token`. This unauthenticated read does not change
+allocation or message state. UUID 0 returns `INVALID_ARGUMENT`. The server returns `NOT_FOUND` unless the UUID has
+already been consumed by a committed message, including when the UUID was never allocated or was allocated but has
+not been used. On success, `seq` is the committed message sequence that consumed the UUID.
+
+### 3.4 Publish
 
 ```protobuf
 rpc Publish(PublishRequest) returns (PublishResponse);
@@ -192,6 +231,8 @@ rpc Publish(PublishRequest) returns (PublishResponse);
 Publishes with a client-specified CAS seq. Success requires valid authentication,
 an allowed payload size, `seq == max_seq+1`, an existing writable Channel, valid
 recipients, and valid object capabilities.
+
+UUID validation, duplicate precedence, and recovery rules are defined in sections 2.4 and 2.9.
 
 | Condition | Status |
 |-----------|--------|
@@ -206,16 +247,16 @@ recipients, and valid object capabilities.
 Success returns an empty response. The server sets `ts_ms` before the message is
 made available to authorized readers.
 
-### 3.3 PublishAutoSeq
+### 3.5 PublishAutoSeq
 
 ```protobuf
 rpc PublishAutoSeq(PublishAutoSeqRequest) returns (PublishAutoSeqResponse);
 ```
 
-Uses the same validation as Publish, but the server allocates seq. The response
-contains the committed message seq.
+Uses the same validation as Publish, except the server allocates seq. UUID validation, duplicate precedence, and
+recovery rules are defined in sections 2.4 and 2.9. The response contains the committed message seq.
 
-### 3.4 Fetch
+### 3.6 Fetch
 
 ```protobuf
 rpc Fetch(FetchRequest) returns (FetchResponse);
@@ -250,7 +291,7 @@ Filtering never moves next_seq backward.
 If a scanned message refers to a Channel that is not present, the call returns
 `INTERNAL`; this does not mark persistent storage corrupt or stop the server.
 
-### 3.5 Subscribe
+### 3.7 Subscribe
 
 ```protobuf
 rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
@@ -382,7 +423,7 @@ rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
 rpc GetChannel(GetChannelRequest) returns (GetChannelResponse);
 ```
 
-Read permission follows section 2.4. Missing Channel returns `NOT_FOUND`; denied
+Read permission follows section 2.5. Missing Channel returns `NOT_FOUND`; denied
 access returns `PERMISSION_DENIED`.
 
 ### 5.3 ListChannels

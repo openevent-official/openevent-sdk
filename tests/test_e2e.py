@@ -45,6 +45,10 @@ def _unique(prefix: str) -> str:
     return f"{prefix}-{time.time_ns()}"
 
 
+def _uuid(client: OpenEventClient) -> int:
+    return client.get_uuid()
+
+
 def _assert_rpc_code(exc_info: pytest.ExceptionInfo[grpc.RpcError], code: grpc.StatusCode) -> None:
     assert exc_info.value.code() == code
 
@@ -66,28 +70,6 @@ def _list_all_tokens(admin: AdminClient, limit: int = 100):
         assert page.next_page_token not in seen_page_tokens
         seen_page_tokens.add(page.next_page_token)
         page_token = page.next_page_token
-
-
-def _fetch_to_watermark(
-    client: OpenEventClient,
-    principal: int,
-    token: str,
-    from_seq: int,
-    last_seq: int,
-):
-    messages = []
-    next_seq = from_seq
-    while next_seq <= last_seq:
-        page = client.fetch(
-            principal=principal,
-            token=token,
-            from_seq=next_seq,
-            limit=1000,
-        )
-        messages.extend(message for message in page.messages if message.seq <= last_seq)
-        assert page.next_seq > next_seq
-        next_seq = page.next_seq
-    return messages
 
 
 class _CommitThenAbortEventService(openevent_pb2_grpc.EventServiceServicer):
@@ -174,6 +156,7 @@ def test_publish_auto_seq_and_fetch_round_trip(admin: AdminClient, client: OpenE
         token=token,
         channel_id=channel.channel_id,
         payload=b"hello e2e",
+        uuid=_uuid(client),
     )
     status = client.get_status(principal=principal, token=token)
     fetched = client.fetch(
@@ -197,6 +180,49 @@ def test_publish_auto_seq_and_fetch_round_trip(admin: AdminClient, client: OpenE
     assert matches[0].ts_ms > 0
 
 
+def test_get_uuid_and_reject_duplicate_uuid(admin: AdminClient, client: OpenEventClient) -> None:
+    principal = 1002
+    token = _token(admin, principal)
+    channel = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-uuid"),
+        visibility=openevent_pb2.VISIBILITY_PUBLIC,
+    ).channel
+
+    first_uuid = client.get_uuid()
+    second_uuid = client.get_uuid()
+    assert second_uuid == first_uuid + 1
+
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.get_seq_by_uuid(0)
+    _assert_rpc_code(exc_info, grpc.StatusCode.INVALID_ARGUMENT)
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.get_seq_by_uuid(second_uuid)
+    _assert_rpc_code(exc_info, grpc.StatusCode.NOT_FOUND)
+
+    first = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=channel.channel_id,
+        payload=b"first UUID write",
+        uuid=first_uuid,
+    )
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.publish_auto_seq(
+            principal=principal,
+            token=token,
+            channel_id=channel.channel_id,
+            payload=b"later duplicate content is not compared",
+            uuid=first_uuid,
+        )
+    _assert_rpc_code(exc_info, grpc.StatusCode.ALREADY_EXISTS)
+    assert client.get_seq_by_uuid(first_uuid) == first.seq
+
+    fetched = client.fetch(principal=principal, token=token, from_seq=first.seq, limit=1)
+    assert fetched.messages[0].uuid == first_uuid
+
+
 def test_publish_cas_success_and_aborted_reuse(admin: AdminClient, client: OpenEventClient) -> None:
     principal = 1101
     token = _token(admin, principal)
@@ -208,9 +234,23 @@ def test_publish_cas_success_and_aborted_reuse(admin: AdminClient, client: OpenE
     ).channel.channel_id
     next_seq = client.get_status(principal=principal, token=token).max_seq + 1
 
-    client.publish(principal=principal, token=token, channel_id=channel_id, seq=next_seq, payload=b"cas-ok")
+    client.publish(
+        principal=principal,
+        token=token,
+        channel_id=channel_id,
+        seq=next_seq,
+        payload=b"cas-ok",
+        uuid=_uuid(client),
+    )
     with pytest.raises(grpc.RpcError) as exc_info:
-        client.publish(principal=principal, token=token, channel_id=channel_id, seq=next_seq, payload=b"cas-repeat")
+        client.publish(
+            principal=principal,
+            token=token,
+            channel_id=channel_id,
+            seq=next_seq,
+            payload=b"cas-repeat",
+            uuid=_uuid(client),
+        )
     _assert_rpc_code(exc_info, grpc.StatusCode.ABORTED)
 
 
@@ -234,6 +274,7 @@ def test_private_channel_acl_and_member_management(admin: AdminClient, client: O
         token=member_token,
         channel_id=channel_id,
         payload=b"member can write",
+        uuid=_uuid(client),
     ).seq
     member_fetch = client.fetch(principal=member, token=member_token, from_seq=member_seq, limit=10)
     assert _messages_by_payload(member_fetch.messages, b"member can write")
@@ -248,6 +289,7 @@ def test_private_channel_acl_and_member_management(admin: AdminClient, client: O
             token=outsider_token,
             channel_id=channel_id,
             payload=b"outsider blocked",
+            uuid=_uuid(client),
         )
     _assert_rpc_code(exc_info, grpc.StatusCode.PERMISSION_DENIED)
 
@@ -278,6 +320,7 @@ def test_private_channel_acl_and_member_management(admin: AdminClient, client: O
             token=member_token,
             channel_id=channel_id,
             payload=b"former member blocked",
+            uuid=_uuid(client),
         )
     _assert_rpc_code(exc_info, grpc.StatusCode.PERMISSION_DENIED)
 
@@ -303,12 +346,14 @@ def test_recipients_filtering(admin: AdminClient, client: OpenEventClient) -> No
         channel_id=channel_id,
         recipients=[recipient],
         payload=b"direct recipient",
+        uuid=_uuid(client),
     ).seq
     client.publish_auto_seq(
         principal=owner,
         token=owner_token,
         channel_id=channel_id,
         payload=b"broadcast without recipients",
+        uuid=_uuid(client),
     )
 
     recipient_messages = client.fetch(
@@ -352,12 +397,14 @@ def test_fetch_channel_filter_and_last_seq(admin: AdminClient, client: OpenEvent
         token=token,
         channel_id=first_channel_id,
         payload=b"fetch first channel",
+        uuid=_uuid(client),
     ).seq
     second_seq = client.publish_auto_seq(
         principal=principal,
         token=token,
         channel_id=second_channel_id,
         payload=b"fetch second channel",
+        uuid=_uuid(client),
     ).seq
     max_published_seq = max(first_seq, second_seq)
 
@@ -420,6 +467,7 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
         token=token,
         channel_id=channel_id,
         payload=b"subscribe history",
+        uuid=_uuid(client),
     ).seq
     history_stream = client.subscribe(principal=principal, token=token, from_seq=history_seq)
     first = next(history_stream)
@@ -437,6 +485,7 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
             token=token,
             channel_id=channel_id,
             payload=b"subscribe future",
+            uuid=_uuid(client),
         ).seq
         future = pending.result(timeout=5)
         assert future.message.seq == future_seq
@@ -471,12 +520,14 @@ def test_subscribe_channel_filter(admin: AdminClient, client: OpenEventClient) -
         token=token,
         channel_id=first_channel_id,
         payload=b"subscribe filtered channel",
+        uuid=_uuid(client),
     ).seq
     selected_seq = client.publish_auto_seq(
         principal=principal,
         token=token,
         channel_id=selected_channel_id,
         payload=b"subscribe selected channel",
+        uuid=_uuid(client),
     ).seq
 
     stream = client.subscribe(
@@ -553,12 +604,14 @@ def test_admin_lists_all_messages_and_ports_are_isolated(
         token=token,
         channel_id=public_channel_id,
         payload=public_payload,
+        uuid=_uuid(client),
     ).seq
     private_seq = client.publish_auto_seq(
         principal=principal,
         token=token,
         channel_id=private_channel_id,
         payload=private_payload,
+        uuid=_uuid(client),
     ).seq
     recipient_seq = client.publish_auto_seq(
         principal=principal,
@@ -566,6 +619,7 @@ def test_admin_lists_all_messages_and_ports_are_isolated(
         channel_id=private_channel_id,
         recipients=[member],
         payload=recipient_payload,
+        uuid=_uuid(client),
     ).seq
 
     first_page = admin.list_messages(from_seq=0, limit=1)
@@ -577,6 +631,7 @@ def test_admin_lists_all_messages_and_ports_are_isolated(
         token=token,
         channel_id=public_channel_id,
         payload=appended_payload,
+        uuid=_uuid(client),
     ).seq
     assert appended_seq > boundary
 
@@ -628,7 +683,7 @@ def test_admin_lists_all_messages_and_ports_are_isolated(
     _assert_rpc_code(exc_info, grpc.StatusCode.UNIMPLEMENTED)
 
 
-def test_uncertain_publish_result_is_reconciled_without_direct_retry(
+def test_uncertain_publish_result_is_reconciled_by_uuid_lookup(
     admin: AdminClient, client: OpenEventClient
 ) -> None:
     principal = 1701
@@ -641,7 +696,8 @@ def test_uncertain_publish_result_is_reconciled_without_direct_retry(
     ).channel.channel_id
 
     auto_before = client.get_status(principal=principal, token=token).max_seq
-    auto_payload = _unique("uncertain-auto").encode()
+    auto_payload = b"uncertain auto publish"
+    auto_uuid = _uuid(client)
     with _commit_then_abort_client() as proxy:
         with pytest.raises(grpc.RpcError) as exc_info:
             proxy.publish_auto_seq(
@@ -649,18 +705,24 @@ def test_uncertain_publish_result_is_reconciled_without_direct_retry(
                 token=token,
                 channel_id=channel_id,
                 payload=auto_payload,
+                uuid=auto_uuid,
             )
         _assert_rpc_code(exc_info, grpc.StatusCode.UNAVAILABLE)
-    auto_watermark = client.get_status(principal=principal, token=token).max_seq
-    auto_matches = _messages_by_payload(
-        _fetch_to_watermark(client, principal, token, auto_before + 1, auto_watermark),
-        auto_payload,
-    )
-    assert len(auto_matches) == 1
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.publish_auto_seq(
+            principal=principal,
+            token=token,
+            channel_id=channel_id,
+            payload=b"later PublishAutoSeq content is not compared",
+            uuid=auto_uuid,
+        )
+    _assert_rpc_code(exc_info, grpc.StatusCode.ALREADY_EXISTS)
+    assert client.get_seq_by_uuid(auto_uuid) == auto_before + 1
 
     cas_before = client.get_status(principal=principal, token=token).max_seq
     cas_seq = cas_before + 1
-    cas_payload = _unique("uncertain-cas").encode()
+    cas_payload = b"uncertain cas publish"
+    cas_uuid = _uuid(client)
     with _commit_then_abort_client() as proxy:
         with pytest.raises(grpc.RpcError) as exc_info:
             proxy.publish(
@@ -669,15 +731,20 @@ def test_uncertain_publish_result_is_reconciled_without_direct_retry(
                 channel_id=channel_id,
                 seq=cas_seq,
                 payload=cas_payload,
+                uuid=cas_uuid,
             )
         _assert_rpc_code(exc_info, grpc.StatusCode.UNAVAILABLE)
-    cas_watermark = client.get_status(principal=principal, token=token).max_seq
-    cas_matches = _messages_by_payload(
-        _fetch_to_watermark(client, principal, token, cas_seq, cas_watermark),
-        cas_payload,
-    )
-    assert len(cas_matches) == 1
-    assert cas_matches[0].seq == cas_seq
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.publish(
+            principal=principal,
+            token=token,
+            channel_id=channel_id,
+            seq=cas_seq,
+            payload=b"later Publish content is not compared",
+            uuid=cas_uuid,
+        )
+    _assert_rpc_code(exc_info, grpc.StatusCode.ALREADY_EXISTS)
+    assert client.get_seq_by_uuid(cas_uuid) == cas_seq
 
 
 def test_object_write_metadata_and_partial_read(admin: AdminClient, client: OpenEventClient) -> None:
@@ -793,6 +860,7 @@ def test_message_object_references(admin: AdminClient, client: OpenEventClient) 
         channel_id=channel_id,
         payload=b"object references",
         object_keys=[key, key],
+        uuid=_uuid(client),
     )
 
     fetched = client.fetch(
@@ -839,6 +907,7 @@ def test_message_object_references(admin: AdminClient, client: OpenEventClient) 
         channel_id=channel_id,
         payload=b"",
         object_keys=exactly_1024,
+        uuid=_uuid(client),
     )
     watermark = client.get_status(principal=principal, token=token).max_seq
     assert watermark == accepted.seq
@@ -850,6 +919,7 @@ def test_message_object_references(admin: AdminClient, client: OpenEventClient) 
             channel_id=channel_id,
             payload=b"",
             object_keys=[key] * 1025,
+            uuid=_uuid(client),
         )
     _assert_rpc_code(exc_info, grpc.StatusCode.INVALID_ARGUMENT)
     assert client.get_status(principal=principal, token=token).max_seq == watermark
@@ -864,6 +934,7 @@ def test_message_object_references(admin: AdminClient, client: OpenEventClient) 
             channel_id=channel_id,
             payload=b"",
             object_keys=[key, invalid_key, key],
+            uuid=_uuid(client),
         )
     _assert_rpc_code(exc_info, grpc.StatusCode.NOT_FOUND)
     assert client.get_status(principal=principal, token=token).max_seq == watermark

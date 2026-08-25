@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
+from threading import Lock
+
 import pytest
 
 from openevent.sdk import AdminClient, OpenEventClient
@@ -19,7 +22,11 @@ def test_public_imports_and_constants() -> None:
     assert openevent_pb2.VISIBILITY_PROTECTED == 1
     assert openevent_pb2.VISIBILITY_PRIVATE == 2
     assert openevent_pb2.CHANNEL_FILTER_ALL == 0
-    event = openevent_pb2.EventMessage(seq=1, channel_id=2, payload=b"ok")
+    event = openevent_pb2.EventMessage(seq=1, channel_id=2, payload=b"ok", uuid=7)
+    allocate_request = openevent_pb2.AllocateUuidsRequest(count=2)
+    allocate_response = openevent_pb2.AllocateUuidsResponse(uuids=[7, 8])
+    uuid_lookup_request = openevent_pb2.GetSeqByUuidRequest(uuid=7)
+    uuid_lookup_response = openevent_pb2.GetSeqByUuidResponse(seq=1)
     request = openevent_pb2.FetchRequest(channels=[2])
     response = openevent_pb2.FetchResponse(messages=[event], next_seq=2, last_seq=1)
     admin_request = admin_pb2.ListMessagesRequest(from_seq=1, limit=10)
@@ -27,6 +34,11 @@ def test_public_imports_and_constants() -> None:
     token_request = admin_pb2.ListTokensRequest(page_token="cursor", limit=10)
     token_response = admin_pb2.ListTokensResponse(next_page_token="next")
     assert event.seq == 1
+    assert event.uuid == 7
+    assert allocate_request.count == 2
+    assert list(allocate_response.uuids) == [7, 8]
+    assert uuid_lookup_request.uuid == 7
+    assert uuid_lookup_response.seq == 1
     assert list(request.channels) == [2]
     assert response.messages[0].payload == b"ok"
     assert response.last_seq == 1
@@ -77,6 +89,42 @@ def test_client_timeout_is_forwarded_to_unary_rpc() -> None:
     client.timeout = 1.25
     client.get_status(1, "token")
     assert stub.timeouts == [1.25]
+
+
+def test_get_uuid_refills_the_local_pool_and_forwards_publish_uuid() -> None:
+    class Stub:
+        def __init__(self):
+            self.allocate_calls = 0
+
+        def AllocateUuids(self, request, timeout=None):
+            self.allocate_calls += 1
+            assert request.count == 1024
+            assert timeout == 1.25
+            return openevent_pb2.AllocateUuidsResponse(uuids=range(11, 1035))
+
+        def PublishAutoSeq(self, request, timeout=None):
+            assert request.uuid == 12
+            assert timeout == 1.25
+            return openevent_pb2.PublishAutoSeqResponse(seq=1)
+
+        def GetSeqByUuid(self, request, timeout=None):
+            assert request.uuid == 12
+            assert timeout == 1.25
+            return openevent_pb2.GetSeqByUuidResponse(seq=1)
+
+    client = OpenEventClient.__new__(OpenEventClient)
+    stub = Stub()
+    client.event_stub = stub
+    client._uuid_pool = deque()
+    client._uuid_pool_lock = Lock()
+    client.timeout = 1.25
+    assert client.get_uuid() == 11
+    assert client.get_uuid() == 12
+    assert stub.allocate_calls == 1
+    assert not hasattr(client, "allocate_uuids")
+    response = client.publish_auto_seq(1, "token", 2, b"payload", uuid=12)
+    assert response.seq == 1
+    assert client.get_seq_by_uuid(12) == 1
 
 
 @pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
@@ -243,6 +291,7 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
 
 def test_proto_service_boundaries_and_admin_field_numbers() -> None:
     assert "AdminService" not in openevent_pb2.DESCRIPTOR.services_by_name
+    event_service = openevent_pb2.DESCRIPTOR.services_by_name["EventService"]
     admin_service = admin_pb2.DESCRIPTOR.services_by_name["AdminService"]
     assert [dependency.name for dependency in openevent_pb2.DESCRIPTOR.dependencies] == []
     assert [dependency.name for dependency in admin_pb2.DESCRIPTOR.dependencies] == ["openevent.proto"]
@@ -268,6 +317,14 @@ def test_proto_service_boundaries_and_admin_field_numbers() -> None:
 
     subscribe_request = openevent_pb2.SubscribeRequest.DESCRIPTOR.fields_by_name
     assert subscribe_request["channels"].number == 5
+
+    uuid_lookup = event_service.methods_by_name["GetSeqByUuid"]
+    assert uuid_lookup.input_type.full_name == "openevent.GetSeqByUuidRequest"
+    assert uuid_lookup.output_type.full_name == "openevent.GetSeqByUuidResponse"
+    uuid_lookup_request = openevent_pb2.GetSeqByUuidRequest.DESCRIPTOR.fields_by_name
+    uuid_lookup_response = openevent_pb2.GetSeqByUuidResponse.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in uuid_lookup_request.items()} == {"uuid": 1}
+    assert {name: field.number for name, field in uuid_lookup_response.items()} == {"seq": 1}
 
 
 def test_object_protocol_descriptors_and_reference_order() -> None:
@@ -333,6 +390,10 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
     object_calls = []
 
     class EventStub:
+        def GetSeqByUuid(self, request, timeout=None):
+            event_calls.append(("get_seq_by_uuid", request, timeout))
+            return openevent_pb2.GetSeqByUuidResponse(seq=9)
+
         def Publish(self, request, timeout=None):
             event_calls.append(("publish", request, timeout))
             return openevent_pb2.PublishResponse()
@@ -361,6 +422,8 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
     first = openevent_pb2.ObjectKey(object_id=1, object_token="first")
     second = openevent_pb2.ObjectKey(object_id=2, object_token="second")
 
+    assert client.get_seq_by_uuid(18) == 9
+
     client.publish(
         principal=7,
         token="principal-token",
@@ -369,6 +432,7 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
         recipients=[10, 11],
         payload=b"publish",
         object_keys=[first, second, first],
+        uuid=17,
     )
     client.publish_auto_seq(
         principal=7,
@@ -377,6 +441,7 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
         recipients=[11, 10],
         payload=b"auto",
         object_keys=[second, first],
+        uuid=18,
     )
     written = client.write_object(
         principal=7,
@@ -389,12 +454,15 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
     metadata = client.get_object_metadata(written.object_id, written.object_token)
     data = client.read_object(written.object_id, written.object_token, offset=1, nbytes=2)
 
-    assert [call[0] for call in event_calls] == ["publish", "publish_auto_seq"]
+    assert [call[0] for call in event_calls] == ["get_seq_by_uuid", "publish", "publish_auto_seq"]
     assert all(call[2] == 4.5 for call in event_calls)
-    assert list(event_calls[0][1].recipients) == [10, 11]
-    assert [key.object_id for key in event_calls[0][1].object_keys] == [1, 2, 1]
-    assert list(event_calls[1][1].recipients) == [11, 10]
-    assert [key.object_id for key in event_calls[1][1].object_keys] == [2, 1]
+    assert event_calls[0][1].uuid == 18
+    assert list(event_calls[1][1].recipients) == [10, 11]
+    assert [key.object_id for key in event_calls[1][1].object_keys] == [1, 2, 1]
+    assert event_calls[1][1].uuid == 17
+    assert list(event_calls[2][1].recipients) == [11, 10]
+    assert [key.object_id for key in event_calls[2][1].object_keys] == [2, 1]
+    assert event_calls[2][1].uuid == 18
 
     assert [call[0] for call in object_calls] == ["write", "metadata", "read"]
     assert all(call[2] == 4.5 for call in object_calls)

@@ -8,7 +8,8 @@ contract documentation, and Python SDK.
 The Python SDK is a lightweight wrapper around generated gRPC stubs. It does not
 add application-level business semantics. Its high-level subscription iterator
 suppresses repeated or backward message `seq` values within one stream. The
-high-level client exposes event, immutable object storage, and Channel RPCs;
+high-level client exposes event, immutable object storage, and Channel RPCs, including individual UUID retrieval from
+an internal pool for deduplicated publishing and committed-sequence lookup by UUID;
 generated stubs remain available when raw gRPC access is required.
 
 ## Directory Layout
@@ -60,7 +61,7 @@ make build
 The wheel is written to:
 
 ```text
-dist/openevent_sdk-0.4.4-py3-none-any.whl
+dist/openevent_sdk-0.6.0-py3-none-any.whl
 ```
 
 Build and install the generated wheel:
@@ -90,7 +91,7 @@ Run end-to-end tests against a real OpenEvent server:
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-End-to-end tests use the `openevent-sdk>=0.4.4` package already installed in
+End-to-end tests use the `openevent-sdk>=0.6.0` package already installed in
 the current Python environment. They do not install this repository into a
 temporary dependency directory or generate SDK protobuf files.
 

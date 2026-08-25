@@ -45,7 +45,7 @@ required = {
     "grpc": "grpcio",
     "packaging": "packaging",
     "pytest": "pytest",
-    "openevent.sdk": "openevent-sdk>=0.4.4",
+    "openevent.sdk": "openevent-sdk>=0.6.0",
 }
 missing = [requirement for module, requirement in required.items() if importlib.util.find_spec(module) is None]
 if missing:
@@ -54,7 +54,7 @@ if missing:
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.4.4", file=sys.stderr)
+    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.6.0", file=sys.stderr)
     sys.exit(2)
 from packaging.version import InvalidVersion, Version
 
@@ -63,8 +63,8 @@ try:
 except InvalidVersion:
     print(f"installed openevent-sdk has an invalid version: {version}", file=sys.stderr)
     sys.exit(2)
-if installed_version < Version("0.4.4"):
-    print(f"openevent-sdk>=0.4.4 is required for e2e tests, found {version}", file=sys.stderr)
+if installed_version < Version("0.6.0"):
+    print(f"openevent-sdk>=0.6.0 is required for e2e tests, found {version}", file=sys.stderr)
     sys.exit(2)
 
 from openevent.sdk import AdminClient, OpenEventClient
@@ -79,14 +79,21 @@ required_object_methods = {"WriteObject", "GetObjectMetadata", "ReadObject"}
 if object_service is None or not required_object_methods.issubset(object_service.methods_by_name):
     print("installed openevent-sdk does not provide the required ObjectStorageService protocol", file=sys.stderr)
     sys.exit(2)
-if "object_keys" not in openevent_pb2.EventMessage.DESCRIPTOR.fields_by_name:
-    print("installed openevent-sdk does not provide EventMessage.object_keys", file=sys.stderr)
+event_fields = openevent_pb2.EventMessage.DESCRIPTOR.fields_by_name
+event_service = openevent_pb2.DESCRIPTOR.services_by_name.get("EventService")
+if "object_keys" not in event_fields or "uuid" not in event_fields:
+    print("installed openevent-sdk does not provide EventMessage.object_keys and uuid", file=sys.stderr)
+    sys.exit(2)
+if event_service is None or not {"AllocateUuids", "GetSeqByUuid"}.issubset(event_service.methods_by_name):
+    print("installed openevent-sdk does not provide the required UUID EventService methods", file=sys.stderr)
     sys.exit(2)
 subscribe_fields = openevent_pb2.SubscribeRequest.DESCRIPTOR.fields_by_name
 if "channels" not in subscribe_fields or subscribe_fields["channels"].number != 5:
     print("installed openevent-sdk does not provide SubscribeRequest.channels=5", file=sys.stderr)
     sys.exit(2)
 required_client_methods = {
+    "get_uuid",
+    "get_seq_by_uuid",
     "write_object",
     "get_object_metadata",
     "read_object",
