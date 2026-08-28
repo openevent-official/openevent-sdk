@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from numbers import Real
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Iterable, Optional
 
 import grpc
@@ -44,6 +44,10 @@ class _DeduplicatingSubscribeStream:
     def __init__(self, stream):
         self._stream = stream
         self._last_seq = None
+        self._started = Event()
+        self._started_lock = Lock()
+        self._started_waiter_started = False
+        self._started_error = None
 
     def __iter__(self):
         return self
@@ -57,6 +61,28 @@ class _DeduplicatingSubscribeStream:
                     continue
                 self._last_seq = seq
             return item
+
+    def wait_started(self, timeout: object) -> None:
+        """Wait for the server to accept the subscription without giving it a deadline."""
+        timeout_seconds = _validate_rpc_timeout(timeout)
+        with self._started_lock:
+            if not self._started_waiter_started:
+                self._started_waiter_started = True
+                Thread(target=self._await_initial_metadata, daemon=True).start()
+
+        if not self._started.wait(timeout_seconds):
+            self.cancel()
+            raise TimeoutError("Subscribe did not receive server initial metadata before timeout")
+        if self._started_error is not None:
+            raise self._started_error
+
+    def _await_initial_metadata(self) -> None:
+        try:
+            self._stream.initial_metadata()
+        except Exception as exc:
+            self._started_error = exc
+        finally:
+            self._started.set()
 
     def __getattr__(self, name):
         return getattr(self._stream, name)

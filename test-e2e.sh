@@ -45,7 +45,7 @@ required = {
     "grpc": "grpcio",
     "packaging": "packaging",
     "pytest": "pytest",
-    "openevent.sdk": "openevent-sdk>=0.6.0",
+    "openevent.sdk": "openevent-sdk>=0.7.0",
 }
 missing = [requirement for module, requirement in required.items() if importlib.util.find_spec(module) is None]
 if missing:
@@ -54,7 +54,7 @@ if missing:
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.6.0", file=sys.stderr)
+    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.7.0", file=sys.stderr)
     sys.exit(2)
 from packaging.version import InvalidVersion, Version
 
@@ -63,8 +63,8 @@ try:
 except InvalidVersion:
     print(f"installed openevent-sdk has an invalid version: {version}", file=sys.stderr)
     sys.exit(2)
-if installed_version < Version("0.6.0"):
-    print(f"openevent-sdk>=0.6.0 is required for e2e tests, found {version}", file=sys.stderr)
+if installed_version < Version("0.7.0"):
+    print(f"openevent-sdk>=0.7.0 is required for e2e tests, found {version}", file=sys.stderr)
     sys.exit(2)
 
 from openevent.sdk import AdminClient, OpenEventClient

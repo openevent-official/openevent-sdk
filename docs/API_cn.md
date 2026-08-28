@@ -2,7 +2,7 @@
 
 [English version](API.md)
 
-> 版本: 0.6.0
+> 版本: 0.7.0
 > 日期: 2026-08-21
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
@@ -294,6 +294,10 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 
 `SubscribeResponse.message` 表示正常消息；`next_seq` 只用于 `from_seq > max_seq`。客户端取消或
 断开后应记录最后已处理 seq，并从 `seq+1` 重新订阅或 Fetch。
+
+认证和显式 Channel 校验成功后，服务端会在等待或推送任何 OpenEvent 消息之前发送 gRPC 初始响应 metadata。
+即使起点消息或当前全部记录都被过滤，这也表示订阅已被接受。该 metadata 是 gRPC 控制响应，不是
+`SubscribeResponse`，也不是 OpenEvent 消息。
 
 有效且已经建立的 Subscribe stream 没有服务端固定存活时长。业务 gRPC 端口在传输层 30 秒没有活动后发送
 一次 HTTP/2 PING；10 秒内收不到确认就关闭连接。服务端只接受间隔不少于 20 秒的客户端 PING。Python

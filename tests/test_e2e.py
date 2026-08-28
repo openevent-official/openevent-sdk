@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
+import socket
+from threading import Event, Lock, Thread
 import time
 from typing import Iterable, Iterator
 
@@ -70,6 +72,89 @@ def _list_all_tokens(admin: AdminClient, limit: int = 100):
         assert page.next_page_token not in seen_page_tokens
         seen_page_tokens.add(page.next_page_token)
         page_token = page.next_page_token
+
+
+class _TcpRelay:
+    def __init__(self, upstream_target: str):
+        host, port = upstream_target.rsplit(":", 1)
+        self._upstream = (host, int(port))
+        self._stopped = Event()
+        self._forwarding = Event()
+        self._forwarding.set()
+        self._connections_lock = Lock()
+        self._connections = []
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen()
+        self._listener.settimeout(0.1)
+        self._accept_thread = Thread(target=self._accept, daemon=True)
+        self._accept_thread.start()
+
+    @property
+    def target(self) -> str:
+        host, port = self._listener.getsockname()
+        return f"{host}:{port}"
+
+    def pause(self) -> None:
+        self._forwarding.clear()
+
+    def close(self) -> None:
+        self._stopped.set()
+        self._forwarding.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        with self._connections_lock:
+            connections = list(self._connections)
+        for connection in connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        self._accept_thread.join(timeout=1)
+
+    def _accept(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                downstream, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                upstream = socket.create_connection(self._upstream, timeout=5)
+            except OSError:
+                downstream.close()
+                continue
+            downstream.settimeout(0.1)
+            upstream.settimeout(0.1)
+            with self._connections_lock:
+                self._connections.extend((downstream, upstream))
+            Thread(target=self._pipe, args=(downstream, upstream), daemon=True).start()
+            Thread(target=self._pipe, args=(upstream, downstream), daemon=True).start()
+
+    def _pipe(self, source: socket.socket, destination: socket.socket) -> None:
+        while not self._stopped.is_set():
+            if not self._forwarding.wait(0.1):
+                continue
+            try:
+                data = source.recv(64 * 1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not data:
+                try:
+                    destination.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                return
+            try:
+                destination.sendall(data)
+            except OSError:
+                return
 
 
 class _CommitThenAbortEventService(openevent_pb2_grpc.EventServiceServicer):
@@ -553,6 +638,81 @@ def test_subscribe_channel_filter(admin: AdminClient, client: OpenEventClient) -
     with pytest.raises(grpc.RpcError) as exc_info:
         next(missing_stream)
     _assert_rpc_code(exc_info, grpc.StatusCode.NOT_FOUND)
+
+
+def test_subscribe_wait_started_before_selected_channel_message(
+    admin: AdminClient, client: OpenEventClient
+) -> None:
+    principal = 1403
+    token = _token(admin, principal)
+    skipped_channel_id = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-subscribe-skipped"),
+        visibility=openevent_pb2.VISIBILITY_PUBLIC,
+    ).channel.channel_id
+    selected_channel_id = client.create_channel(
+        principal=principal,
+        token=token,
+        name=_unique("sdk-e2e-subscribe-wait-started"),
+        visibility=openevent_pb2.VISIBILITY_PUBLIC,
+    ).channel.channel_id
+    start_seq = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=skipped_channel_id,
+        payload=b"subscribe wait-started skipped channel",
+        uuid=_uuid(client),
+    ).seq
+
+    stream = client.subscribe(
+        principal=principal,
+        token=token,
+        from_seq=start_seq,
+        channels=[selected_channel_id],
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        stream.wait_started(5)
+        pending = executor.submit(next, stream)
+        time.sleep(0.1)
+        assert not pending.done()
+        selected_seq = client.publish_auto_seq(
+            principal=principal,
+            token=token,
+            channel_id=selected_channel_id,
+            payload=b"subscribe wait-started selected channel",
+            uuid=_uuid(client),
+        ).seq
+        response = pending.result(timeout=5)
+    finally:
+        stream.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    assert response.message.seq == selected_seq
+    assert response.message.channel_id == selected_channel_id
+
+
+def test_subscribe_keepalive_closes_a_silently_dropped_transport(admin: AdminClient) -> None:
+    principal = 1404
+    token = _token(admin, principal)
+    relay = _TcpRelay(_event_target())
+    client = OpenEventClient(relay.target)
+    stream = client.subscribe(principal=principal, token=token, from_seq=0)
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        stream.wait_started(5)
+        pending = executor.submit(next, stream)
+        time.sleep(0.1)
+        relay.pause()
+        with pytest.raises(grpc.RpcError) as exc_info:
+            pending.result(timeout=50)
+        assert exc_info.value.code() != grpc.StatusCode.OK
+    finally:
+        stream.cancel()
+        client.close()
+        relay.close()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_token_delete_changes_authentication(admin: AdminClient, client: OpenEventClient) -> None:

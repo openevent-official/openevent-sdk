@@ -2,7 +2,7 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.6.0
+> Version: 0.7.0
 > Date: 2026-08-21
 
 This document defines the public behavior of the business protocol
@@ -323,6 +323,12 @@ server.
 `SubscribeResponse.message` carries normal messages. `next_seq` is only used for
 the `from_seq > max_seq` boundary. After disconnect, resume from the last
 processed `seq + 1` using Subscribe or Fetch.
+
+After authentication and explicit Channel validation succeed, the server sends
+gRPC initial response metadata before it waits for or pushes an OpenEvent
+message. This confirms that the subscription was accepted even when its starting
+seq or every current record is filtered out. The metadata is a gRPC control
+response, not a `SubscribeResponse` or an OpenEvent message.
 
 The OpenEvent server has no fixed lifetime for a valid, established Subscribe
 stream. Its public gRPC endpoint sends an HTTP/2 PING after 30 seconds without

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from threading import Lock
+from threading import Event, Lock
 
 import pytest
 
@@ -308,6 +308,48 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
     stream = client.subscribe(principal=7, token="token", from_seq=2, channels=[11, 12])
     assert stream.cancel()
     assert stub.stream.cancelled
+
+
+def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
+    class ReadyStream:
+        def initial_metadata(self):
+            return ()
+
+    ready = client_module._DeduplicatingSubscribeStream(ReadyStream())
+    assert ready.wait_started(1) is None
+
+    release = Event()
+
+    class PendingStream:
+        def __init__(self):
+            self.cancelled = False
+
+        def initial_metadata(self):
+            release.wait()
+            return ()
+
+        def cancel(self):
+            self.cancelled = True
+            release.set()
+            return True
+
+    pending_stream = PendingStream()
+    pending = client_module._DeduplicatingSubscribeStream(pending_stream)
+    with pytest.raises(TimeoutError, match="initial metadata"):
+        pending.wait_started(0.01)
+    assert pending_stream.cancelled
+    assert release.wait(1)
+
+    with pytest.raises(ValueError, match="finite number greater than 0"):
+        ready.wait_started(0)
+
+    class FailedStream:
+        def initial_metadata(self):
+            raise RuntimeError("subscription rejected")
+
+    failed = client_module._DeduplicatingSubscribeStream(FailedStream())
+    with pytest.raises(RuntimeError, match="subscription rejected"):
+        failed.wait_started(1)
 
 
 def test_proto_service_boundaries_and_admin_field_numbers() -> None:

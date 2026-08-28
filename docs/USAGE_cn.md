@@ -11,7 +11,7 @@
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.6.0-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.7.0-py3-none-any.whl
 ```
 
 开发本仓库时，可以直接生成 protobuf 代码并使用源码：
@@ -224,7 +224,7 @@ response = client.fetch(
 
 ## 订阅消息
 
-`subscribe` 返回兼容 gRPC stream 的迭代器；它保留 `cancel()` 等 gRPC call 方法，同时执行下述
+`subscribe` 返回兼容 gRPC stream 的迭代器；它提供 `cancel()` 和 `wait_started(timeout)`，同时执行下述
 SDK 序号检查：
 
 ```python
@@ -240,6 +240,11 @@ for item in client.subscribe(
     else:
         print("next seq:", item.next_seq)
 ```
+
+`wait_started(timeout)` 等待服务端发送初始响应 metadata。调用方需要区分“服务端已经接受订阅”和“仍在尝试
+建立连接”时可使用它。`timeout` 必须是大于 0 的有限秒数；超时会取消本次 stream 并抛出 `TimeoutError`。
+服务端接受前发生的 RPC 错误原样抛出。成功返回不为已经建立的 stream 设置 deadline，也不等待任何
+OpenEvent 消息。
 
 `from_seq=0` 表示从当前最新位置之后开始等待新消息。传入 `channels=[...]` 时，列表中的每个 Channel
 都必须存在且调用方有读取权限；校验通过后只接收这些 Channel 中调用方可读的消息。省略或传入空列表
