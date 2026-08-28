@@ -18,10 +18,16 @@ except ImportError as exc:  # pragma: no cover
 
 _DEFAULT_MAX_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024
 _DEFAULT_RPC_TIMEOUT_SECONDS = 30.0
+_SUBSCRIBE_KEEPALIVE_TIME_MS = 30_000
+_SUBSCRIBE_KEEPALIVE_TIMEOUT_MS = 10_000
 _UUID_POOL_BATCH_SIZE = 1024
 _DEFAULT_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
     ("grpc.max_receive_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
+    ("grpc.keepalive_time_ms", _SUBSCRIBE_KEEPALIVE_TIME_MS),
+    ("grpc.keepalive_timeout_ms", _SUBSCRIBE_KEEPALIVE_TIMEOUT_MS),
+    ("grpc.keepalive_permit_without_calls", 0),
+    ("grpc.http2.max_pings_without_data", 0),
 )
 
 
@@ -220,7 +226,7 @@ class OpenEventClient:
                 only_my_recipient=only_my_recipient,
                 channels=list(channels),
             ),
-            timeout=self.timeout,
+            timeout=None,
         )
         return _DeduplicatingSubscribeStream(stream)
 

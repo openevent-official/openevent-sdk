@@ -36,8 +36,14 @@ token = "user-token"
 或自定义 channel，可以创建 `grpc.Channel` 后传给 `OpenEventClient(target, channel=...)`。
 
 `OpenEventClient` 和 `AdminClient` 的构造函数都接受 `timeout`，默认值为 30 秒。该值必须是有限且
-大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`。同一 deadline 作用于
-所有 RPC，包括 `subscribe` 整条 stream 的生命周期，因此高层 client 调用不会无限等待。
+大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`。该 deadline 作用于
+全部非流式 RPC。`OpenEventClient.subscribe` 特意不设置 RPC deadline：空闲但健康的订阅会一直保持，
+直到调用方取消、服务端结束或 gRPC 传输失败。
+
+`OpenEventClient` 自己创建的 channel 会对 Subscribe 使用公开的 gRPC 传输层保活策略。这是传输层连通性
+检查，不是 OpenEvent 消息，因此不会出现在订阅中。连接断开后，订阅会结束；如果注册了完成回调，也会执行，
+不需要等待单个 RPC 的 deadline。通过 `channel=...` 传入的 channel 由调用方拥有和配置；用它订阅时，调用方
+必须设置服务端接受的保活策略。PING 间隔和兼容性要求以 [Subscribe API 契约](API_cn.md#37-subscribe) 为准。
 
 client 不再使用时应调用 `client.close()`，也可以把它用作 context manager。`close()` 可以重复调用。
 client 只关闭自己创建的 gRPC channel；通过 `channel=...` 传入的 channel 始终由调用方管理和关闭。
@@ -238,8 +244,8 @@ for item in client.subscribe(
 `from_seq=0` 表示从当前最新位置之后开始等待新消息。传入 `channels=[...]` 时，列表中的每个 Channel
 都必须存在且调用方有读取权限；校验通过后只接收这些 Channel 中调用方可读的消息。省略或传入空列表
 时不按 Channel ID 过滤。订阅运行期间显式 Channel 失去读取权限时，stream 返回 `PERMISSION_DENIED` 并
-结束。客户端 timeout 到期时 stream 以 `DEADLINE_EXCEEDED` 结束。任何中断发生前都应记录已经处理到的 `seq`，之后从 `seq + 1` 重新订阅
-或拉取。
+结束。高层 SDK 不给 Subscribe 设置 deadline。发生任何中断，包括 gRPC 保活失败，都应记录已经处理到的
+`seq`，之后从 `seq + 1` 重新订阅或拉取。
 
 服务端开始正常或致命关闭时，会主动结束已经建立的 stream；客户端同样应记录最后处理到的 `seq`，
 之后从 `seq + 1` 重新订阅或拉取。

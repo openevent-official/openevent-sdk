@@ -204,6 +204,27 @@ def test_client_context_manager_closes_owned_channel(monkeypatch, client_type) -
     assert channel.close_calls == 1
 
 
+def test_open_event_client_enables_subscribe_keepalive_on_owned_channel(monkeypatch) -> None:
+    channel = _CloseTrackingChannel()
+    captured_options = []
+
+    def create_channel(target, options):
+        assert target == "unused"
+        captured_options.extend(options)
+        return channel
+
+    monkeypatch.setattr(client_module.grpc, "insecure_channel", create_channel)
+    _patch_stub_constructors(monkeypatch)
+
+    client = OpenEventClient("unused")
+    client.close()
+
+    assert ("grpc.keepalive_time_ms", 30_000) in captured_options
+    assert ("grpc.keepalive_timeout_ms", 10_000) in captured_options
+    assert ("grpc.keepalive_permit_without_calls", 0) in captured_options
+    assert ("grpc.http2.max_pings_without_data", 0) in captured_options
+
+
 @pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
 def test_client_closes_owned_channel_when_stub_construction_fails(
     monkeypatch, client_type
@@ -254,7 +275,7 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
             assert request.token == "token"
             assert request.from_seq == 2
             assert list(request.channels) == [11, 12]
-            assert timeout == 2.5
+            assert timeout is None
             self.stream = Stream(
                 [
                     openevent_pb2.SubscribeResponse(

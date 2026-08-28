@@ -324,6 +324,14 @@ server.
 the `from_seq > max_seq` boundary. After disconnect, resume from the last
 processed `seq + 1` using Subscribe or Fetch.
 
+The OpenEvent server has no fixed lifetime for a valid, established Subscribe
+stream. Its public gRPC endpoint sends an HTTP/2 PING after 30 seconds without
+transport activity and closes a connection whose PING acknowledgement does not
+arrive within 10 seconds. It accepts client PINGs no more frequent than every 20
+seconds. The Python high-level client sends client PINGs every 30 seconds and
+does not set a deadline for Subscribe; a caller using another gRPC client or a
+custom channel must configure a compatible transport keepalive policy.
+
 When the server begins normal or fatal shutdown, it actively ends every
 established Subscribe stream. Treat this like any other stream interruption:
 record the last processed `seq` and resume from `seq + 1` using Subscribe or

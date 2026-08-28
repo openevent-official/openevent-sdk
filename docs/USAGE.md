@@ -39,9 +39,19 @@ create a `grpc.Channel` and pass it with `OpenEventClient(target, channel=...)`.
 
 `OpenEventClient` and `AdminClient` accept a constructor `timeout` with a
 30-second default. It must be a finite number greater than zero; `None`, boolean,
-zero, negative, NaN, and infinite values raise `ValueError`. The same deadline is
-used by every RPC, including the complete lifetime of a `subscribe` stream, so
-high-level client calls cannot wait forever.
+zero, negative, NaN, and infinite values raise `ValueError`. The deadline applies
+to every non-streaming RPC. `OpenEventClient.subscribe` deliberately has no RPC
+deadline: an idle, healthy subscription remains open until the caller cancels it,
+the server ends it, or the gRPC transport fails.
+
+For channels created by `OpenEventClient`, gRPC uses the documented transport
+keepalive policy for Subscribe. This is a transport liveness check, not an
+OpenEvent message, so it never appears in a subscription. A broken connection
+therefore finishes the subscription (and invokes a done callback, if registered)
+without waiting for a per-RPC deadline. A channel passed through `channel=...` is
+owned and configured by the caller; configure a server-compatible keepalive policy
+when that channel is used for Subscribe. The authoritative PING intervals and
+compatibility requirements are in the [Subscribe API contract](API.md#37-subscribe).
 
 Call `client.close()` when the client is no longer needed, or use it as a
 context manager. `close()` is idempotent. A client closes only the gRPC channel
@@ -258,9 +268,9 @@ and be readable by the caller; any failed check ends the stream with an error.
 After validation, only readable messages from those Channels are pushed. Omit it
 or pass an empty list to disable Channel filtering. If an explicitly listed
 Channel becomes unreadable while the stream is running, a later batch ends the
-stream with `PERMISSION_DENIED`. The stream ends with `DEADLINE_EXCEEDED` when
-the client timeout expires. Record the last processed `seq` and resume from
-`seq + 1` after any interruption.
+stream with `PERMISSION_DENIED`. The high-level SDK does not impose a deadline on
+Subscribe. Record the last processed `seq` and resume from `seq + 1` after any
+interruption, including a gRPC keepalive failure.
 
 When the server begins normal or fatal shutdown, it actively ends every
 established stream. Treat this like any other interruption: record the last
