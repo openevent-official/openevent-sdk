@@ -76,15 +76,6 @@ class AdminClient:
             timeout=self.timeout,
         )
 
-    def list_tokens(self, page_token: str = "", limit: int = 1000):
-        return self.stub.ListTokens(
-            admin_pb2.ListTokensRequest(
-                page_token=page_token,
-                limit=limit,
-            ),
-            timeout=self.timeout,
-        )
-
     def list_messages(self, from_seq: int = 0, limit: int = 1000):
         return self.stub.ListMessages(
             admin_pb2.ListMessagesRequest(

@@ -31,7 +31,7 @@ install: build
 	  printf 'no wheel found in dist\n'; \
 	  exit 1; \
 	fi; \
-	"$(PYTHON)" -m pip install $(INSTALL_ARGS) "$$wheel"
+	PYTHONDONTWRITEBYTECODE=1 "$(PYTHON)" -m pip install --no-compile $(INSTALL_ARGS) "$$wheel"
 
 test:
 	PYTHON="$(PYTHON)" ./test.sh $(TEST_ARGS)

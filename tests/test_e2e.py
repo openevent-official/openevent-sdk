@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
+import json
+import subprocess
 import socket
 from threading import Event, Lock, Thread
 import time
@@ -29,14 +31,57 @@ def _admin_target() -> str:
     return os.environ.get("OPENEVENT_E2E_ADMIN_TARGET", "127.0.0.1:19528")
 
 
-@pytest.fixture(scope="session")
-def admin() -> AdminClient:
-    return AdminClient(_admin_target())
+def _free_address():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return f"127.0.0.1:{sock.getsockname()[1]}"
 
 
-@pytest.fixture(scope="session")
-def client() -> OpenEventClient:
-    return OpenEventClient(_event_target())
+@pytest.fixture
+def server(tmp_path, monkeypatch):
+    public = _free_address()
+    admin_address = _free_address()
+    while admin_address == public:
+        admin_address = _free_address()
+    monkeypatch.setenv("OPENEVENT_E2E_TARGET", public)
+    monkeypatch.setenv("OPENEVENT_E2E_ADMIN_TARGET", admin_address)
+    config = tmp_path / "server.yaml"
+    config.write_text(
+        f'grpc:\n  listen_addr: "{public}"\n'
+        f'admin:\n  listen_addr: "{admin_address}"\n'
+        f'storage:\n  path: "{tmp_path / "data"}"\n'
+        'limits:\n  max_payload_bytes: 62914560\n'
+    )
+    with (tmp_path / "server.log").open("w") as log:
+        process = subprocess.Popen([os.environ["OPENEVENT_SERVER_BIN"], str(config)], stdout=log, stderr=log)
+        try:
+            for address in (public, admin_address):
+                with grpc.insecure_channel(address) as channel:
+                    grpc.channel_ready_future(channel).result(timeout=10)
+            assert process.poll() is None
+            yield process
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    pytest.fail("server did not shut down after ending subscriptions")
+            assert process.returncode == 0
+
+
+@pytest.fixture
+def admin(server) -> Iterator[AdminClient]:
+    with AdminClient(_admin_target()) as value:
+        yield value
+
+
+@pytest.fixture
+def client(server) -> Iterator[OpenEventClient]:
+    with OpenEventClient(_event_target()) as value:
+        yield value
 
 
 def _token(admin: AdminClient, principal: int) -> str:
@@ -57,21 +102,6 @@ def _assert_rpc_code(exc_info: pytest.ExceptionInfo[grpc.RpcError], code: grpc.S
 
 def _messages_by_payload(messages: Iterable, payload: bytes):
     return [message for message in messages if message.payload == payload]
-
-
-def _list_all_tokens(admin: AdminClient, limit: int = 100):
-    bindings = []
-    page_token = ""
-    seen_page_tokens = set()
-    while True:
-        page = admin.list_tokens(page_token=page_token, limit=limit)
-        assert len(page.bindings) <= limit
-        bindings.extend(page.bindings)
-        if not page.next_page_token:
-            return bindings
-        assert page.next_page_token not in seen_page_tokens
-        seen_page_tokens.add(page.next_page_token)
-        page_token = page.next_page_token
 
 
 class _TcpRelay:
@@ -279,9 +309,7 @@ def test_get_uuid_and_reject_duplicate_uuid(admin: AdminClient, client: OpenEven
     second_uuid = client.get_uuid()
     assert second_uuid == first_uuid + 1
 
-    with pytest.raises(grpc.RpcError) as exc_info:
-        client.get_seq_by_uuid(0)
-    _assert_rpc_code(exc_info, grpc.StatusCode.INVALID_ARGUMENT)
+    assert client.get_seq_by_uuid(0) == 0
     with pytest.raises(grpc.RpcError) as exc_info:
         client.get_seq_by_uuid(second_uuid)
     _assert_rpc_code(exc_info, grpc.StatusCode.NOT_FOUND)
@@ -561,6 +589,8 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
     assert first.message.payload == b"subscribe history"
 
     future_stream = client.subscribe(principal=principal, token=token, from_seq=0)
+    assert next(future_stream).message.seq == 0
+    assert next(future_stream).message.seq == history_seq
     executor = ThreadPoolExecutor(max_workers=1)
     pending = executor.submit(next, future_stream)
     try:
@@ -580,9 +610,10 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
         executor.shutdown(wait=True, cancel_futures=True)
 
     max_seq = client.get_status(principal=principal, token=token).max_seq
-    boundary = list(client.subscribe(principal=principal, token=token, from_seq=max_seq + 10))
-    assert len(boundary) == 1
-    assert boundary[0].next_seq == max_seq + 1
+    boundary = client.subscribe(principal=principal, token=token, from_seq=max_seq + 1)
+    with pytest.raises(grpc.RpcError) as exc_info:
+        boundary.wait_started(5)
+    _assert_rpc_code(exc_info, grpc.StatusCode.OUT_OF_RANGE)
 
 
 def test_subscribe_channel_filter(admin: AdminClient, client: OpenEventClient) -> None:
@@ -702,6 +733,7 @@ def test_subscribe_keepalive_closes_a_silently_dropped_transport(admin: AdminCli
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         stream.wait_started(5)
+        assert next(stream).message.seq == 0
         pending = executor.submit(next, stream)
         time.sleep(0.1)
         relay.pause()
@@ -718,21 +750,13 @@ def test_subscribe_keepalive_closes_a_silently_dropped_transport(admin: AdminCli
 def test_token_delete_changes_authentication(admin: AdminClient, client: OpenEventClient) -> None:
     principal = 1501
     token = _token(admin, principal)
-    pagination_tokens = {_token(admin, 1502), _token(admin, 1503)}
     client.get_status(principal=principal, token=token)
 
     admin.delete_token(target_token=token)
-    remaining = _list_all_tokens(admin, limit=1)
 
     with pytest.raises(grpc.RpcError) as exc_info:
         client.get_status(principal=principal, token=token)
     _assert_rpc_code(exc_info, grpc.StatusCode.UNAUTHENTICATED)
-    remaining_tokens = {binding.token for binding in remaining}
-    assert token not in remaining_tokens
-    assert pagination_tokens.issubset(remaining_tokens)
-
-    for pagination_token in pagination_tokens:
-        admin.delete_token(target_token=pagination_token)
 
 
 def test_admin_lists_all_messages_and_ports_are_isolated(
@@ -1123,3 +1147,255 @@ def test_object_response_loss_does_not_trigger_sdk_retry(
     data = client.read_object(committed.object_id, committed.object_token, 0, metadata.nbytes)
     assert metadata.name == "lost-response.bin"
     assert data.data == b"committed despite lost response"
+
+
+def test_system_initialization_and_zero_start(admin, client):
+    token = _token(admin, 2001)
+    system = client.get_channel(2001, token, 0).channel
+    assert (system.channel_id, system.name, system.protocol, system.description) == (0, "system", "system.v1", "")
+    assert system.visibility == openevent_pb2.VISIBILITY_PROTECTED
+    assert not system.HasField("creator") and not system.members
+    assert client.get_seq_by_uuid(0) == 0
+    status = client.get_status(2001, token)
+    assert status.min_seq == status.max_seq == 0
+    assert [c.channel_id for c in client.list_channels(2001, token).channels] == [0]
+    for mode in (openevent_pb2.CHANNEL_FILTER_JOINED, openevent_pb2.CHANNEL_FILTER_OWNED):
+        assert not client.list_channels(2001, token, filter=mode).channels
+    message = admin.list_messages(0, 1).messages[0]
+    assert message.seq == message.channel_id == message.principal == message.uuid == 0
+    assert not message.recipients and not message.object_keys
+    assert json.loads(message.payload) == {
+        "kind": "system.initialization", "data": {"schema_version": 1},
+        "timestamps": {"event_ms": message.ts_ms},
+    }
+    assert client.fetch(2001, token, 0, 1).messages[0] == message
+    assert not client.fetch(2001, token, 0, 1, only_my_recipient=True).messages
+    channel = client.create_channel(2001, token, _unique("filtered-system")).channel.channel_id
+    assert not client.fetch(2001, token, 0, 1, channels=[channel]).messages
+    stream = client.subscribe(2001, token)
+    try:
+        stream.wait_started(5)
+        assert next(stream).message == message
+    finally:
+        stream.cancel()
+
+
+def test_reserved_principals_and_system_mutations(admin, client):
+    token = _token(admin, 2002)
+    channel = client.create_channel(2002, token, _unique("reserved")).channel.channel_id
+    invalid = [
+        lambda: admin.add_token(0), lambda: admin.delete_token(""),
+        lambda: client.get_status(0, token), lambda: client.fetch(0, token, 0, 1),
+        lambda: client.get_channel(0, token, 0), lambda: client.list_channels(0, token),
+        lambda: client.create_channel(0, token, "zero"),
+        lambda: client.create_channel(2002, token, "zero", members=[0]),
+        lambda: client.add_member(2002, token, channel, 0),
+        lambda: client.remove_member(2002, token, channel, 0),
+        lambda: client.write_object(0, token, "name", "type", b"x"),
+        lambda: client.publish_auto_seq(0, token, channel, b"x", client.get_uuid()),
+        lambda: client.publish_auto_seq(2002, token, channel, b"x", client.get_uuid(), recipients=[0]),
+        lambda: client.publish(2002, token, channel, 1, b"x", client.get_uuid(), recipients=[0]),
+        lambda: client.publish_auto_seq(2002, token, channel, b"x", 0),
+    ]
+    for call in invalid:
+        with pytest.raises(grpc.RpcError) as error:
+            call()
+        assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    for call in (
+        lambda: client.publish_auto_seq(2002, token, 0, b"x", client.get_uuid()),
+        lambda: client.add_member(2002, token, 0, 2003),
+        lambda: client.remove_member(2002, token, 0, 2003),
+    ):
+        with pytest.raises(grpc.RpcError) as error:
+            call()
+        assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
+    assert client.get_status(2002, token).max_seq == 0
+    admin.delete_token("absent-token")
+    admin.delete_token("absent-token")
+
+
+@pytest.mark.parametrize("visibility", [0, 1, 2])
+def test_remove_member_write_order_and_duplicate_uuid(admin, client, visibility):
+    owner, member = 2101, 2102
+    owner_token, member_token = _token(admin, owner), _token(admin, member)
+    channel = client.create_channel(owner, owner_token, _unique("removal"), visibility=visibility, members=[member]).channel.channel_id
+    used = client.get_uuid()
+    seq = client.publish_auto_seq(member, member_token, channel, b"before", used).seq
+    client.remove_member(owner, owner_token, channel, member)
+    # A consumed UUID wins even if the writer's membership has since changed.
+    with pytest.raises(grpc.RpcError) as error:
+        client.publish_auto_seq(member, member_token, channel, b"changed", used)
+    assert error.value.code() == grpc.StatusCode.ALREADY_EXISTS
+    assert client.get_seq_by_uuid(used) == seq
+    if visibility == openevent_pb2.VISIBILITY_PUBLIC:
+        client.publish_auto_seq(member, member_token, channel, b"after", client.get_uuid())
+    else:
+        with pytest.raises(grpc.RpcError) as error:
+            client.publish_auto_seq(member, member_token, channel, b"after", client.get_uuid())
+        assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
+    if visibility == openevent_pb2.VISIBILITY_PRIVATE:
+        for call in (
+            lambda: client.get_channel(member, member_token, channel),
+            lambda: client.fetch(member, member_token, seq, 10, channels=[channel]),
+        ):
+            with pytest.raises(grpc.RpcError) as error:
+                call()
+            assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
+    else:
+        assert client.fetch(member, member_token, seq, 1, channels=[channel]).messages[0].payload == b"before"
+    assert client.fetch(owner, owner_token, seq, 1).messages[0].payload == b"before"
+
+
+@pytest.mark.parametrize("visibility,explicit", [(1, True), (2, True), (2, False)])
+def test_subscription_observes_member_removal_and_token_deletion(admin, client, visibility, explicit):
+    owner, member = 2201, 2202
+    owner_token, member_token = _token(admin, owner), _token(admin, member)
+    private = client.create_channel(owner, owner_token, _unique("membership"), visibility=visibility, members=[member]).channel.channel_id
+    public = client.create_channel(owner, owner_token, _unique("public")).channel.channel_id
+    start = client.publish_auto_seq(owner, owner_token, private, b"before", client.get_uuid()).seq
+    stream = client.subscribe(member, member_token, from_seq=start, channels=[private] if explicit else [])
+    try:
+        stream.wait_started(5)
+        assert next(stream).message.seq == start
+        client.remove_member(owner, owner_token, private, member)
+        if visibility == 2 and explicit:
+            with pytest.raises(grpc.RpcError) as error:
+                next(stream)
+            assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
+            return
+        private_seq = client.publish_auto_seq(owner, owner_token, private, b"after-private", client.get_uuid()).seq
+        public_seq = client.publish_auto_seq(owner, owner_token, public, b"after-public", client.get_uuid()).seq
+        assert next(stream).message.seq == (private_seq if visibility == 1 else public_seq)
+        admin.delete_token(member_token)
+        with pytest.raises(grpc.RpcError) as error:
+            next(stream)
+        assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
+    finally:
+        stream.cancel()
+
+
+def test_channel_creation_parameter_limits(admin, client):
+    token = _token(admin, 2301)
+    # 1024 request members plus the creator is a legal 1025-member result.
+    channel = client.create_channel(2301, token, "n" * 255, protocol="p" * 255,
+        description="d" * 4096, members=range(3000, 4024)).channel
+    assert len(channel.members) == 1025 and 2301 in channel.members
+    client.add_member(2301, token, channel.channel_id, 5000)
+    assert len(client.get_channel(2301, token, channel.channel_id).channel.members) == 1026
+    duplicates = client.create_channel(2301, token, "duplicates", members=[2301, 2302, 2302]).channel
+    assert list(duplicates.members) == [2301, 2302]
+    for fields in ({"name": ""}, {"name": "n" * 256}, {"name": "名" * 86},
+                   {"protocol": "p" * 256}, {"description": "d" * 4097}, {"members": [2301] * 1025}):
+        arguments = {"name": "valid", **fields}
+        with pytest.raises(grpc.RpcError) as error:
+            client.create_channel(2301, token, **arguments)
+        assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("large", [False, True])
+def test_message_pagination_preserves_all_payloads(admin, client, large):
+    token = _token(admin, 2401)
+    channel = client.create_channel(2401, token, _unique("pages")).channel.channel_id
+    payloads = ([bytes([n]) * (size * 1024 * 1024) for n, size in enumerate([10, 10, 20])]
+                if large else [f"message-{n}".encode() for n in range(7)])
+    expected = [(client.publish_auto_seq(2401, token, channel, payload, client.get_uuid()).seq, payload)
+                for payload in payloads]
+    limit = 100 if large else 2
+    for reader in (lambda cursor: client.fetch(2401, token, cursor, limit, channels=[channel]),
+                   lambda cursor: admin.list_messages(cursor, limit)):
+        cursor, actual = expected[0][0], []
+        while True:
+            page = reader(cursor)
+            assert page.next_seq > cursor
+            assert len(page.messages) <= limit
+            if large:
+                assert len(page.messages) == 1
+            actual.extend((message.seq, message.payload) for message in page.messages)
+            cursor = page.next_seq
+            if cursor > page.last_seq:
+                break
+        assert actual == expected
+        page = reader(cursor + 100)
+        assert not page.messages and page.next_seq == page.last_seq + 1
+
+
+def test_disconnect_and_inclusive_resume(admin, client):
+    token = _token(admin, 2501)
+    channel = client.create_channel(2501, token, _unique("resume")).channel.channel_id
+    first = client.publish_auto_seq(2501, token, channel, b"one", client.get_uuid()).seq
+    relay = _TcpRelay(_event_target())
+    with OpenEventClient(relay.target) as proxied:
+        stream = proxied.subscribe(2501, token, from_seq=first)
+        try:
+            assert next(stream).message.seq == first
+            relay.close()
+            with pytest.raises(grpc.RpcError):
+                next(stream)
+        finally:
+            stream.cancel()
+            relay.close()
+    inclusive = client.subscribe(2501, token, from_seq=first)
+    try:
+        assert next(inclusive).message.seq == first
+    finally:
+        inclusive.cancel()
+    second = client.publish_auto_seq(2501, token, channel, b"two", client.get_uuid()).seq
+    resumed = client.subscribe(2501, token, from_seq=first + 1)
+    try:
+        assert next(resumed).message.seq == second
+    finally:
+        resumed.cancel()
+
+
+def test_filtered_pagination_reaches_later_visible_messages(admin, client):
+    token = _token(admin, 2601)
+    selected = client.create_channel(2601, token, _unique("selected")).channel.channel_id
+    other = client.create_channel(2601, token, _unique("other")).channel.channel_id
+    expected = []
+    for index in range(12):
+        channel = selected if index in (0, 4, 11) else other
+        recipients = [2601] if index != 4 else []
+        payload = str(index).encode()
+        seq = client.publish_auto_seq(2601, token, channel, payload, client.get_uuid(), recipients=recipients).seq
+        if channel == selected and recipients:
+            expected.append((seq, payload))
+    cursor, actual = 0, []
+    while True:
+        page = client.fetch(2601, token, cursor, 1, channels=[selected], only_my_recipient=True)
+        assert page.next_seq > cursor
+        actual.extend((message.seq, message.payload) for message in page.messages)
+        cursor = page.next_seq
+        if cursor > page.last_seq:
+            break
+    assert actual == expected
+
+
+def test_wait_started_distinguishes_acceptance_from_rejection(admin, client):
+    token = _token(admin, 2701)
+    for fields, expected in [
+        ({"principal": 0, "token": token}, grpc.StatusCode.INVALID_ARGUMENT),
+        ({"principal": 2701, "token": "wrong"}, grpc.StatusCode.UNAUTHENTICATED),
+        ({"principal": 2701, "token": token, "from_seq": 1}, grpc.StatusCode.OUT_OF_RANGE),
+        ({"principal": 2701, "token": token, "channels": [999]}, grpc.StatusCode.NOT_FOUND),
+    ]:
+        stream = client.subscribe(**fields)
+        try:
+            with pytest.raises(grpc.RpcError) as error:
+                stream.wait_started(5)
+            assert error.value.code() == expected
+        finally:
+            stream.cancel()
+    stream = client.subscribe(2701, token, only_my_recipient=True)
+    try:
+        # Receive acceptance directly so wait_started is first called after stream termination.
+        stream.initial_metadata()
+        ended = Event()
+        stream.add_done_callback(lambda _: ended.set())
+        admin.delete_token(token)
+        assert ended.wait(5)
+        assert stream.wait_started(5) is None
+        with pytest.raises(grpc.RpcError) as error:
+            next(stream)
+        assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
+    finally:
+        stream.cancel()

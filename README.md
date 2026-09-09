@@ -3,7 +3,8 @@
 [中文版](README_cn.md)
 
 `openevent-sdk` contains the shared OpenEvent Protocol Buffers schema, API
-contract documentation, and Python SDK.
+contract documentation, the public `system.v1` initialization-message protocol,
+and Python SDK.
 
 The Python SDK is a lightweight wrapper around generated gRPC stubs. It does not
 add application-level business semantics. Its high-level subscription iterator
@@ -20,7 +21,9 @@ openevent-sdk/
 │   ├── admin.proto
 │   └── openevent.proto
 ├── docs/
-│   └── API.md
+│   ├── API.md
+│   ├── SYSTEM_PROTOCOL.md
+│   └── USAGE.md
 ├── Makefile
 ├── build.sh
 ├── generate_python_proto.sh
@@ -61,7 +64,7 @@ make build
 The wheel is written to:
 
 ```text
-dist/openevent_sdk-0.7.0-py3-none-any.whl
+dist/openevent_sdk-0.8.0-py3-none-any.whl
 ```
 
 Build and install the generated wheel:
@@ -78,8 +81,7 @@ make install INSTALL_ARGS="--target /opt/openevent-sdk"
 make install INSTALL_ARGS="--prefix /opt/openevent-sdk"
 ```
 
-Run tests. If there are no test files yet, this runs SDK import and protobuf
-smoke checks:
+Run SDK unit tests, generating the protocol and installing the package in a test-only directory:
 
 ```bash
 make test
@@ -91,9 +93,12 @@ Run end-to-end tests against a real OpenEvent server:
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-End-to-end tests use the `openevent-sdk>=0.7.0` package already installed in
+End-to-end tests use the `openevent-sdk>=0.8.0` package already installed in
 the current Python environment. They do not install this repository into a
-temporary dependency directory or generate SDK protobuf files.
+temporary dependency directory or generate SDK protobuf files. The current Python
+environment also needs `pytest` and `packaging`. Each case uses independent data
+and temporary ports, starts and stops its server, and keeps logs under
+`build/e2e/cases/`. Pass pytest options with `TEST_ARGS` and select Python with `PYTHON`.
 
 Clean build products and temporary files:
 
@@ -107,8 +112,11 @@ make clean
 - [Admin protocol definition](proto/admin.proto)
 - [Usage guide](docs/USAGE.md)
 - [API contract](docs/API.md)
+- [System protocol](docs/SYSTEM_PROTOCOL.md)
 - [Business client](src/openevent/sdk/client.py)
 - [Admin client](src/openevent/sdk/admin_client.py)
 
 `docs/API.md` only documents public fields, RPC behavior, error semantics, and
 compatibility guidance. It does not describe server implementation details.
+`docs/SYSTEM_PROTOCOL.md` is the authoritative public schema for the permanent
+seq-0 initialization message in the reserved system Channel.

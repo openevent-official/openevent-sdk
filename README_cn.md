@@ -2,8 +2,8 @@
 
 [English version](README.md)
 
-`openevent-sdk` 包含 OpenEvent 共享的 Protocol Buffers 协议、API 契约文档
-和 Python SDK。
+`openevent-sdk` 包含 OpenEvent 共享的 Protocol Buffers 协议、API 契约文档、
+公开的 `system.v1` 初始化消息协议和 Python SDK。
 
 Python SDK 是生成的 gRPC stub 的轻量封装，不增加应用层业务语义。高层订阅迭代器只在单条
 stream 内过滤重复或回退的消息 `seq`。高层 client 暴露 Event、不可变对象存储和 Channel RPC，并从内部池中
@@ -18,7 +18,9 @@ openevent-sdk/
 │   ├── admin.proto
 │   └── openevent.proto
 ├── docs/
-│   └── API.md
+│   ├── API.md
+│   ├── SYSTEM_PROTOCOL.md
+│   └── USAGE.md
 ├── Makefile
 ├── build.sh
 ├── generate_python_proto.sh
@@ -56,7 +58,7 @@ make build
 构建完成后，wheel 位于：
 
 ```text
-dist/openevent_sdk-0.7.0-py3-none-any.whl
+dist/openevent_sdk-0.8.0-py3-none-any.whl
 ```
 
 构建并安装生成的 wheel：
@@ -72,7 +74,7 @@ make install INSTALL_ARGS="--target /opt/openevent-sdk"
 make install INSTALL_ARGS="--prefix /opt/openevent-sdk"
 ```
 
-运行测试；当前没有测试文件时会执行 SDK 导入和 protobuf smoke check：
+运行 SDK 单元测试（生成协议并在测试专用环境中安装待测包）：
 
 ```bash
 make test
@@ -84,8 +86,10 @@ make test
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-端到端测试使用当前 Python 环境中已经安装好的 `openevent-sdk>=0.7.0` 包；不会把
-本仓库安装到临时依赖目录，也不会在 e2e 脚本里生成 SDK protobuf 文件。
+端到端测试使用当前 Python 环境中已经安装好的 `openevent-sdk>=0.8.0` 包；不会把
+本仓库安装到临时依赖目录，也不会在 e2e 脚本里生成 SDK protobuf 文件。当前 Python 环境还需安装
+`pytest` 和 `packaging`。每个用例使用独立数据目录和临时端口，自动启动和关闭服务端；日志保存在
+`build/e2e/cases/`。用 `TEST_ARGS` 传递 pytest 参数，用 `PYTHON` 选择 Python 环境。
 
 清理构建产物和临时文件：
 
@@ -99,8 +103,10 @@ make clean
 - [管理协议定义](proto/admin.proto)
 - [使用指南](docs/USAGE_cn.md)
 - [API 契约](docs/API_cn.md)
+- [系统协议](docs/SYSTEM_PROTOCOL_cn.md)
 - [业务客户端](src/openevent/sdk/client.py)
 - [管理客户端](src/openevent/sdk/admin_client.py)
 
-`docs/API.md` 只描述公开字段、RPC 行为、错误语义和兼容性建议，不记录服务端
+`docs/API_cn.md` 只描述公开字段、RPC 行为、错误语义和兼容性建议，不记录服务端
 实现细节。
+`docs/SYSTEM_PROTOCOL_cn.md` 是保留系统 Channel 中永久 seq=0 初始化消息的公开 schema 权威来源。

@@ -26,7 +26,7 @@ _DEFAULT_CHANNEL_OPTIONS = (
     ("grpc.max_receive_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
     ("grpc.keepalive_time_ms", _SUBSCRIBE_KEEPALIVE_TIME_MS),
     ("grpc.keepalive_timeout_ms", _SUBSCRIBE_KEEPALIVE_TIMEOUT_MS),
-    ("grpc.keepalive_permit_without_calls", 0),
+    ("grpc.keepalive_permit_without_calls", 1),
     ("grpc.http2.max_pings_without_data", 0),
 )
 
@@ -78,7 +78,10 @@ class _DeduplicatingSubscribeStream:
 
     def _await_initial_metadata(self) -> None:
         try:
-            self._stream.initial_metadata()
+            metadata = self._stream.initial_metadata()
+            if not metadata and hasattr(self._stream, "done") and self._stream.done():
+                if self._stream.code() != grpc.StatusCode.OK:
+                    raise self._stream
         except Exception as exc:
             self._started_error = exc
         finally:
@@ -118,6 +121,8 @@ class OpenEventClient:
         if getattr(self, "_closed", True):
             return
         self._closed = True
+        with self._uuid_pool_lock:
+            self._uuid_pool.clear()
         if getattr(self, "_owns_channel", False):
             self.channel.close()
 

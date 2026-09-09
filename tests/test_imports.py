@@ -31,8 +31,6 @@ def test_public_imports_and_constants() -> None:
     response = openevent_pb2.FetchResponse(messages=[event], next_seq=2, last_seq=1)
     admin_request = admin_pb2.ListMessagesRequest(from_seq=1, limit=10)
     admin_response = admin_pb2.ListMessagesResponse(messages=[event], next_seq=2, last_seq=1)
-    token_request = admin_pb2.ListTokensRequest(page_token="cursor", limit=10)
-    token_response = admin_pb2.ListTokensResponse(next_page_token="next")
     assert event.seq == 1
     assert event.uuid == 7
     assert allocate_request.count == 2
@@ -44,17 +42,10 @@ def test_public_imports_and_constants() -> None:
     assert response.last_seq == 1
     assert admin_request.limit == 10
     assert admin_response.messages[0].seq == 1
-    assert token_request.page_token == "cursor"
-    assert token_request.limit == 10
-    assert token_response.next_page_token == "next"
 
     captured = []
 
     class Stub:
-        def ListTokens(self, request, timeout=None):
-            captured.append((request, timeout))
-            return admin_pb2.ListTokensResponse(next_page_token="server-next")
-
         def ListMessages(self, request, timeout=None):
             captured.append((request, timeout))
             return admin_pb2.ListMessagesResponse(next_seq=11, last_seq=10)
@@ -62,16 +53,10 @@ def test_public_imports_and_constants() -> None:
     admin_client = AdminClient.__new__(AdminClient)
     admin_client.stub = Stub()
     admin_client.timeout = 30.0
-    listed = admin_client.list_tokens(page_token="server-cursor", limit=7)
-    assert captured[0][0].page_token == "server-cursor"
-    assert captured[0][0].limit == 7
-    assert captured[0][1] == 30.0
-    assert listed.next_page_token == "server-next"
-
     messages = admin_client.list_messages(from_seq=3, limit=8)
-    assert captured[1][0].from_seq == 3
-    assert captured[1][0].limit == 8
-    assert captured[1][1] == 30.0
+    assert captured[0][0].from_seq == 3
+    assert captured[0][0].limit == 8
+    assert captured[0][1] == 30.0
     assert messages.next_seq == 11
 
 
@@ -221,7 +206,7 @@ def test_open_event_client_enables_subscribe_keepalive_on_owned_channel(monkeypa
 
     assert ("grpc.keepalive_time_ms", 30_000) in captured_options
     assert ("grpc.keepalive_timeout_ms", 10_000) in captured_options
-    assert ("grpc.keepalive_permit_without_calls", 0) in captured_options
+    assert ("grpc.keepalive_permit_without_calls", 1) in captured_options
     assert ("grpc.http2.max_pings_without_data", 0) in captured_options
 
 
@@ -278,6 +263,8 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
             assert timeout is None
             self.stream = Stream(
                 [
+                    openevent_pb2.SubscribeResponse(message=openevent_pb2.EventMessage(seq=0)),
+                    openevent_pb2.SubscribeResponse(message=openevent_pb2.EventMessage(seq=0)),
                     openevent_pb2.SubscribeResponse(
                         message=openevent_pb2.EventMessage(seq=2, payload=b"first")
                     ),
@@ -290,7 +277,6 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
                     openevent_pb2.SubscribeResponse(
                         message=openevent_pb2.EventMessage(seq=4, payload=b"second")
                     ),
-                    openevent_pb2.SubscribeResponse(next_seq=5),
                 ]
             )
             return self.stream
@@ -303,8 +289,7 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
         client.subscribe(principal=7, token="token", from_seq=2, channels=[11, 12])
     )
 
-    assert [response.message.seq for response in responses if response.HasField("message")] == [2, 4]
-    assert responses[-1].next_seq == 5
+    assert [response.message.seq for response in responses if response.HasField("message")] == [0, 2, 4]
     stream = client.subscribe(principal=7, token="token", from_seq=2, channels=[11, 12])
     assert stream.cancel()
     assert stub.stream.cancelled
@@ -371,15 +356,10 @@ def test_proto_service_boundaries_and_admin_field_numbers() -> None:
     assert list_messages_response["next_seq"].number == 2
     assert list_messages_response["last_seq"].number == 3
 
-    list_tokens_request = admin_pb2.ListTokensRequest.DESCRIPTOR.fields_by_name
-    assert list_tokens_request["page_token"].number == 1
-    assert list_tokens_request["limit"].number == 2
-    list_tokens_response = admin_pb2.ListTokensResponse.DESCRIPTOR.fields_by_name
-    assert list_tokens_response["bindings"].number == 1
-    assert list_tokens_response["next_page_token"].number == 2
-
     subscribe_request = openevent_pb2.SubscribeRequest.DESCRIPTOR.fields_by_name
+    assert subscribe_request["from_seq"].number == 3
     assert subscribe_request["channels"].number == 5
+    assert list(openevent_pb2.SubscribeResponse.DESCRIPTOR.fields_by_name) == ["message"]
 
     uuid_lookup = event_service.methods_by_name["GetSeqByUuid"]
     assert uuid_lookup.input_type.full_name == "openevent.GetSeqByUuidRequest"
@@ -541,3 +521,63 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
     assert object_calls[2][1].nbytes == 2
     assert metadata.nbytes == 4
     assert data.data == b"data"
+
+
+@pytest.mark.parametrize("client_type,method,stub_name,rpc,args,kwargs,response_type", [
+    (OpenEventClient, "get_status", "event_stub", "GetStatus", (7, "token"), {}, openevent_pb2.GetStatusResponse),
+    (OpenEventClient, "fetch", "event_stub", "Fetch", (7, "token", 0, 2), {"channels": [3, 2, 3], "only_my_recipient": True}, openevent_pb2.FetchResponse),
+    (OpenEventClient, "create_channel", "channel_stub", "CreateChannel", (7, "token", "name"), {"members": [9, 8, 9], "protocol": "raw", "description": "description", "visibility": 2}, openevent_pb2.CreateChannelResponse),
+    (OpenEventClient, "get_channel", "channel_stub", "GetChannel", (7, "token", 3), {}, openevent_pb2.GetChannelResponse),
+    (OpenEventClient, "list_channels", "channel_stub", "ListChannels", (7, "token"), {"filter": 2}, openevent_pb2.ListChannelsResponse),
+    (OpenEventClient, "add_member", "channel_stub", "AddMember", (7, "token", 3, 9), {}, openevent_pb2.AddMemberResponse),
+    (OpenEventClient, "remove_member", "channel_stub", "RemoveMember", (7, "token", 3, 9), {}, openevent_pb2.RemoveMemberResponse),
+    (AdminClient, "add_token", "stub", "AddToken", (7,), {}, admin_pb2.AddTokenResponse),
+    (AdminClient, "delete_token", "stub", "DeleteToken", ("exact-token",), {}, admin_pb2.DeleteTokenResponse),
+])
+def test_remaining_wrappers_forward_and_preserve_responses(client_type, method, stub_name, rpc, args, kwargs, response_type):
+    import inspect
+    from types import SimpleNamespace
+
+    response = response_type()
+    captured = []
+
+    def call(request, timeout):
+        assert timeout == 1.75
+        captured.append(request)
+        return response
+
+    client = client_type.__new__(client_type)
+    client.timeout = 1.75
+    setattr(client, stub_name, SimpleNamespace(**{rpc: call}))
+    wrapper = getattr(client, method)
+    assert wrapper(*args, **kwargs) is response
+    bound = inspect.signature(wrapper).bind(*args, **kwargs)
+    bound.apply_defaults()
+    for name, expected in bound.arguments.items():
+        actual = getattr(captured[0], name)
+        assert list(actual) == expected if isinstance(expected, list) else actual == expected
+
+
+def test_uuid_pool_refills_in_order_and_is_discarded_on_close(monkeypatch):
+    _patch_stub_constructors(monkeypatch)
+    channel = _CloseTrackingChannel()
+    calls = []
+
+    class Stub:
+        def AllocateUuids(self, request, timeout):
+            start = len(calls) * 1024 + 1
+            calls.append(request.count)
+            return openevent_pb2.AllocateUuidsResponse(uuids=range(start, start + 1024))
+
+        def GetSeqByUuid(self, request, timeout):
+            return openevent_pb2.GetSeqByUuidResponse(seq=0)
+
+    client = OpenEventClient("unused", channel=channel)
+    client.event_stub = Stub()
+    assert [client.get_uuid() for _ in range(1025)] == list(range(1, 1026))
+    assert calls == [1024, 1024]
+    assert client.get_seq_by_uuid(0) == 0
+    assert client.get_uuid() == 1026
+    client.close()
+    assert not client._uuid_pool
+    assert channel.close_calls == 0

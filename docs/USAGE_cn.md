@@ -11,7 +11,7 @@
 
 ```bash
 make build
-python3 -m pip install dist/openevent_sdk-0.7.0-py3-none-any.whl
+python3 -m pip install dist/openevent_sdk-0.8.0-py3-none-any.whl
 ```
 
 开发本仓库时，可以直接生成 protobuf 代码并使用源码：
@@ -36,7 +36,7 @@ token = "user-token"
 或自定义 channel，可以创建 `grpc.Channel` 后传给 `OpenEventClient(target, channel=...)`。
 
 `OpenEventClient` 和 `AdminClient` 的构造函数都接受 `timeout`，默认值为 30 秒。该值必须是有限且
-大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`。该 deadline 作用于
+大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`，构造和重新赋值使用相同校验。该 deadline 作用于
 全部非流式 RPC。`OpenEventClient.subscribe` 特意不设置 RPC deadline：空闲但健康的订阅会一直保持，
 直到调用方取消、服务端结束或 gRPC 传输失败。
 
@@ -54,6 +54,15 @@ with OpenEventClient("127.0.0.1:9527") as scoped_client:
     status = scoped_client.get_status(principal, token)
 ```
 
+### RPC 返回值
+
+| 方法 | 返回值 |
+| --- | --- |
+| `get_uuid()` | Python `int`，表示一个已分配的 UUID |
+| `get_seq_by_uuid(uuid)` | Python `int`，表示该 UUID 对应的已提交消息 seq |
+| `subscribe(...)` | 兼容 gRPC stream 的迭代器，每次产出一个 `SubscribeResponse` |
+| 其余业务和管理 RPC 封装方法 | 对应的原始 protobuf response，包括返回空 response 的 RPC |
+
 ## 创建 Channel
 
 ```python
@@ -66,6 +75,7 @@ created = client.create_channel(
     visibility=openevent_pb2.VISIBILITY_PUBLIC,
     protocol="text/plain",
     description="Community discussion",
+    members=[1002, 1003],
 )
 
 channel_id = created.channel.channel_id
@@ -77,9 +87,17 @@ channel_id = created.channel.channel_id
 - `VISIBILITY_PROTECTED`：所有已认证用户可读，成员可写。
 - `VISIBILITY_PRIVATE`：成员可读写。
 
+保留系统 Channel 的 `channel_id=0`、name 为 `system`、protocol 为 `system.v1`。它由服务端拥有且只读。
+每个完成初始化的服务端都永久保存它的 `seq=0` 初始化消息；payload schema 见
+[系统协议](SYSTEM_PROTOCOL_cn.md)。业务 principal 必须大于 0。
+
 ## 发布消息
 
-每次逻辑发布前从 SDK 取出一个 UUID。SDK 在内部维护并补充内存 UUID 池。最简单的方式是让服务端分配全局 `seq`：
+每次逻辑发布前调用 `get_uuid()` 取出一个 UUID。每个 client 有自己的内存池；池空时调用一次
+`AllocateUuids(count=1024)`，按返回顺序逐个取出。池不持久化、不在 client 间共享，关闭 client 或退出进程
+会丢弃尚未取出的 UUID。发布时显式传入 UUID，SDK 不自动填充或重试。
+
+最简单的方式是让服务端分配全局 `seq`：
 
 ```python
 payload = "hello OpenEvent".encode("utf-8")
@@ -131,9 +149,9 @@ except grpc.RpcError as exc:
 
 `get_seq_by_uuid()` 返回已被 committed 消息消费的 UUID 所对应的 seq。其协议行为以 API 契约 3.3 节为准。
 
-SDK 自建的 gRPC channel 默认把单条收发消息上限设为 64 MiB，以容纳默认 16 MiB payload 和分页
-响应。调用方注入自定义 channel 时必须自行设置足够的 `grpc.max_send_message_length` 和
-`grpc.max_receive_message_length`。
+SDK 自建的 gRPC channel 把单条收发消息上限固定为 64 MiB。调用方注入自定义 channel 时必须自行设置
+足够的 `grpc.max_send_message_length` 和 `grpc.max_receive_message_length`；读取旧消息所需的传输上限
+不随当前 payload 写入限制降低，见 [Payload API](API_cn.md#23-payload)。
 
 ## 写入和引用对象
 
@@ -191,7 +209,7 @@ chunk = client.read_object(
 response = client.fetch(
     principal=principal,
     token=token,
-    from_seq=1,
+    from_seq=0,
     limit=100,
     channels=[channel_id],
 )
@@ -203,11 +221,9 @@ next_seq = response.next_seq
 last_seq = response.last_seq
 ```
 
-`response.messages` 包含 `EventMessage`。传入 `channels=[...]` 时，列表中的每个 Channel 都必须存在且
-调用方有读取权限；校验通过后只读取指定 Channel。任一 Channel 校验失败都会拒绝整个请求。省略或传空
-列表时读取调用方可见的所有 Channel。继续读取时，把上一次响应的 `next_seq`
-作为新的 `from_seq`。如果 `next_seq <= last_seq`，继续 Fetch 可能还会扫描到更多已提交消息；
-如果 `next_seq > last_seq`，表示本次响应已经到达当前已提交尾部。
+上例只读取指定业务 Channel，并过滤系统 Channel。继续读取时，把响应的 `next_seq` 作为新的 `from_seq`；
+`next_seq > last_seq` 表示到达本页观察到的尾部。短页或空页不一定表示结束，完整过滤、分页和错误规则见
+[Fetch API](API_cn.md#36-fetch)。
 
 如果只想读取定向发送给自己的消息：
 
@@ -234,11 +250,8 @@ for item in client.subscribe(
     from_seq=0,
     channels=[channel_id],
 ):
-    if item.HasField("message"):
-        message = item.message
-        print(message.seq, message.payload)
-    else:
-        print("next seq:", item.next_seq)
+    message = item.message
+    print(message.seq, message.payload)
 ```
 
 `wait_started(timeout)` 等待服务端发送初始响应 metadata。调用方需要区分“服务端已经接受订阅”和“仍在尝试
@@ -246,22 +259,16 @@ for item in client.subscribe(
 服务端接受前发生的 RPC 错误原样抛出。成功返回不为已经建立的 stream 设置 deadline，也不等待任何
 OpenEvent 消息。
 
-`from_seq=0` 表示从当前最新位置之后开始等待新消息。传入 `channels=[...]` 时，列表中的每个 Channel
-都必须存在且调用方有读取权限；校验通过后只接收这些 Channel 中调用方可读的消息。省略或传入空列表
-时不按 Channel ID 过滤。订阅运行期间显式 Channel 失去读取权限时，stream 返回 `PERMISSION_DENIED` 并
-结束。高层 SDK 不给 Subscribe 设置 deadline。发生任何中断，包括 gRPC 保活失败，都应记录已经处理到的
-`seq`，之后从 `seq + 1` 重新订阅或拉取。
-
-服务端开始正常或致命关闭时，会主动结束已经建立的 stream；客户端同样应记录最后处理到的 `seq`，
-之后从 `seq + 1` 重新订阅或拉取。
+上例从 seq 0 开始扫描所选业务 Channel，到达尾部后继续等待新消息。起点边界、权限变化导致的结束或
+过滤，以及服务端关闭后的恢复方式统一见 [Subscribe API](API_cn.md#37-subscribe)。
 
 高层 `OpenEventClient.subscribe` 迭代器会在同一条 stream 内按消息 `seq` 丢弃重复或回退的消息。
-跨连接仍需由调用方持久化最后处理的 `seq`，并从 `seq + 1` 恢复；需要原始 stream 时可以直接
-使用生成式 gRPC stub。
+SDK 不自动重连，去重水位也不跨连接。调用方保存最后处理的 seq，并按 API 恢复规则处理重放；需要原始
+stream 时可以直接使用生成式 gRPC stub。
 
 ## 定向消息
 
-发布时可以传入 `recipients`：
+发布时可以传入 `recipients`。下面使用创建 Channel 示例中已经加入的成员 1002 和 1003：
 
 ```python
 client.publish_auto_seq(
@@ -274,12 +281,12 @@ client.publish_auto_seq(
 )
 ```
 
-`recipients` 中的 principal 必须是对应 Channel 的成员。读取时设置
-`only_my_recipient=True` 会只返回 `recipients` 包含当前 `principal` 的消息。
+读取时设置 `only_my_recipient=True` 可筛选发给自己的消息；成员要求与过滤语义见
+[Recipients API](API_cn.md#26-recipients)。
 
 ## 管理 token
 
-`AdminClient` 访问 `AdminService`。该服务通常运行在独立管理端口，是否暴露给外部取决于部署配置。
+`AdminClient` 访问只运行在独立管理端口的 `AdminService`。
 
 ```python
 from openevent.sdk import AdminClient
@@ -289,14 +296,6 @@ admin = AdminClient("127.0.0.1:9528")
 binding = admin.add_token(target_principal=1001).binding
 print("已创建 token，principal:", binding.principal)
 
-page_token = ""
-while True:
-    token_page = admin.list_tokens(page_token=page_token, limit=100)
-    print("本页 token binding 数量:", len(token_page.bindings))
-    if not token_page.next_page_token:
-        break
-    page_token = token_page.next_page_token
-
 admin.delete_token(binding.token)
 
 message_page = admin.list_messages(from_seq=0, limit=100)
@@ -305,12 +304,8 @@ for message in message_page.messages:
 
 ```
 
-`binding.token`、ListTokens 返回的 token 和分页使用的 page token 都是敏感凭据。示例只在内存中
-使用这些值，不应把它们写入日志、trace、错误信息或普通控制台输出。
-
-`ListTokens` 使用不透明 `page_token` 分页，`next_page_token=""` 表示结束；token 可增删，因此
-跨页不构成强快照。`ListMessages` 是管理查询，不经过业务 Channel ACL 过滤；下一页使用
-`next_seq` 作为包含起点的游标。部署时必须保护管理端口。
+上例创建并删除 token，再读取一页管理消息。消息下一页使用 `next_seq` 继续。
+管理查询契约见 [AdminService API](API_cn.md#6-adminservice)；部署时必须保护管理端口。
 
 ## 错误处理
 
@@ -334,18 +329,4 @@ except grpc.RpcError as exc:
 
 ## 本地开发
 
-常用命令：
-
-```bash
-make init
-make test
-make build
-make clean
-```
-
-`make init` 会把 Python protobuf 代码生成到
-[`src/openevent/sdk/proto/`](../src/openevent/sdk/proto/)。
-生成的 `openevent_pb2*.py` 和 `admin_pb2*.py` 不进 git，但会被构建进 wheel。
-
-`make build` 使用 Hatchling 构建 wheel，构建依赖、测试依赖、缓存和临时文件放在 `build/`，
-最终产物放在 `dist/`。
+生成 proto、构建、安装、测试和清理的命令统一见 [README 的构建和测试](../README_cn.md#构建和测试)。

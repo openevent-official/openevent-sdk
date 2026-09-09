@@ -31,14 +31,14 @@ message ObjectKey {
 }
 
 message EventMessage {
-    uint64 seq = 1;               // Global message sequence; monotonically increasing; clients must not rely on adjacency
-    uint64 ts_ms = 2;             // Unix timestamp in milliseconds when the server receives the publish request
+    uint64 seq = 1;               // Global message sequence; business messages advance from the committed max_seq + 1
+    uint64 ts_ms = 2;             // Unix milliseconds at request receipt; initialization event time for seq 0
     uint64 channel_id = 3;
     uint64 principal = 4;         // Sender principal
     repeated uint64 recipients = 5;  // Recipient principal list
     bytes payload = 6;
     repeated ObjectKey object_keys = 7;  // Object capability references attached to this message
-    uint64 uuid = 8;               // Server-allocated message deduplication UUID; 0 is invalid
+    uint64 uuid = 8;               // Server-allocated message UUID; 0 is reserved for system initialization
 }
 
 message ChannelInfo {
@@ -74,7 +74,7 @@ message AllocateUuidsResponse {
 }
 
 message GetSeqByUuidRequest {
-    uint64 uuid = 1;               // UUID previously allocated by AllocateUuids
+    uint64 uuid = 1;               // Allocated business UUID, or 0 for system initialization
 }
 
 message GetSeqByUuidResponse {
@@ -87,8 +87,8 @@ message GetStatusRequest {
 }
 
 message GetStatusResponse {
-    uint64 min_seq = 1;           // Lowest available message sequence; 0 when the message sequence is empty
-    uint64 max_seq = 2;           // Highest committed message sequence; 0 when the message sequence is empty
+    uint64 min_seq = 1;           // Lowest available message sequence; always 0
+    uint64 max_seq = 2;           // Highest committed sequence; 0 means only the system initialization message exists
 }
 
 message PublishRequest {
@@ -122,10 +122,10 @@ message PublishAutoSeqResponse {
 message FetchRequest {
     uint64 principal = 1;
     string token = 2;
-    uint64 from_seq = 3;          // Inclusive starting sequence; 0 returns an empty result immediately
+    uint64 from_seq = 3;          // Inclusive starting sequence; 0 starts from the system initialization message
     uint32 limit = 4;             // Maximum visible messages to return; required; range 1..1000
     bool only_my_recipient = 5;   // If true, return only messages whose recipients contain principal
-    repeated uint64 channels = 6;  // Explicit IDs must exist and be readable; empty disables Channel filtering
+    repeated uint64 channels = 6;  // Explicit IDs must exist and be readable; empty selects all readable Channels
 }
 
 message FetchResponse {
@@ -137,16 +137,13 @@ message FetchResponse {
 message SubscribeRequest {
     uint64 principal = 1;
     string token = 2;
-    uint64 from_seq = 3;          // Starting sequence; 0 starts after the current max_seq
+    uint64 from_seq = 3;          // Inclusive starting sequence; 0 starts from the system initialization message
     bool only_my_recipient = 4;   // If true, push only messages whose recipients contain principal
-    repeated uint64 channels = 5; // Explicit IDs must exist and be readable; empty disables Channel filtering
+    repeated uint64 channels = 5; // Explicit IDs must exist and be readable; empty selects all readable Channels
 }
 
 message SubscribeResponse {
-    oneof result {
-        EventMessage message = 1; // Message delivered by the subscription
-        uint64 next_seq = 2;      // Suggested next start when from_seq > max_seq; the stream then ends
-    }
+    EventMessage message = 1;     // Every response contains one message
 }
 
 // ============================================================================
