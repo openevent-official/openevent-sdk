@@ -33,9 +33,10 @@ principal = 1001
 token = "user-token"
 ```
 
-`target` is the gRPC service address. By default the SDK uses
-`grpc.insecure_channel`. If your deployment requires TLS or a custom channel,
-create a `grpc.Channel` and pass it with `OpenEventClient(target, channel=...)`.
+`target` is the gRPC service address. `OpenEventClient` and `AdminClient` create
+`grpc.insecure_channel` instances with fixed transport options and do not accept
+a caller-provided channel. Use the generated gRPC stubs directly when TLS or
+other custom gRPC connection options are required.
 
 `OpenEventClient` and `AdminClient` accept a constructor `timeout` with a
 30-second default. It must be a finite number greater than zero; `None`, boolean,
@@ -45,20 +46,17 @@ to every non-streaming RPC. `OpenEventClient.subscribe` deliberately has no RPC
 deadline: an idle, healthy subscription remains open until the caller cancels it,
 the server ends it, or the gRPC transport fails.
 
-For channels created by `OpenEventClient`, gRPC uses the documented transport
+The channel created by `OpenEventClient` uses the documented transport
 keepalive policy for Subscribe. This is a transport liveness check, not an
 OpenEvent message, so it never appears in a subscription. A broken connection
 therefore finishes the subscription (and invokes a done callback, if registered)
-without waiting for a per-RPC deadline. A channel passed through `channel=...` is
-owned and configured by the caller; configure a server-compatible keepalive policy
-when that channel is used for Subscribe. The authoritative PING intervals and
+without waiting for a per-RPC deadline. The authoritative PING intervals and
 compatibility requirements are in the [Subscribe API contract](API.md#37-subscribe).
 
 Call `client.close()` when the client is no longer needed, or use it as a
-context manager. `close()` is idempotent. A client closes only the gRPC channel
-it created itself; a channel passed with `channel=...` remains owned by the
-caller and must be closed by the caller. The destructor is only a fallback for
-an omitted explicit close because Python does not guarantee when it runs.
+context manager. `close()` is idempotent and closes the gRPC channel created by
+the client. The destructor is only a fallback for an omitted explicit close
+because Python does not guarantee when it runs.
 
 ```python
 with OpenEventClient("127.0.0.1:9527") as scoped_client:
@@ -168,10 +166,8 @@ except grpc.RpcError as exc:
 in API contract section 3.3.
 
 SDK-created gRPC channels use fixed per-message send and receive limits of
-64 MiB. Callers that inject a custom channel must configure sufficient
-`grpc.max_send_message_length` and `grpc.max_receive_message_length` values;
-the transport limit needed to read historical messages does not decrease with
-the current payload write limit. See the [Payload API](API.md#23-payload).
+64 MiB. The transport limit needed to read historical messages does not decrease
+with the current payload write limit. See the [Payload API](API.md#23-payload).
 
 ## Write and Reference Objects
 

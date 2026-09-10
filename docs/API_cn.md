@@ -324,7 +324,7 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 有效且已经建立的 Subscribe stream 没有服务端固定存活时长。业务 gRPC 端口在传输层 30 秒没有活动后发送
 一次 HTTP/2 PING；10 秒内收不到确认就关闭连接。服务端只接受间隔不少于 20 秒的客户端 PING。Python
 高层 client 每 30 秒发送一次客户端 PING，并且不为 Subscribe 设置 deadline；使用其他 gRPC client 或
-自定义 channel 的调用方必须配置与服务端兼容的传输层保活策略。
+生成式 stub 的调用方必须为自己的 channel 配置与服务端兼容的传输层保活策略。
 
 服务端开始正常或致命关闭时，会主动结束已经建立的 Subscribe stream；客户端应按其他 stream 中断
 处理，记录最后已处理的 seq，并按上述恢复规则继续订阅或 Fetch。

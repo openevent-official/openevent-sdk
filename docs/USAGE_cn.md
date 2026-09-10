@@ -32,22 +32,22 @@ principal = 1001
 token = "user-token"
 ```
 
-`target` 是 gRPC 服务地址。默认使用 `grpc.insecure_channel`；如果你的部署需要 TLS
-或自定义 channel，可以创建 `grpc.Channel` 后传给 `OpenEventClient(target, channel=...)`。
+`target` 是 gRPC 服务地址。`OpenEventClient` 和 `AdminClient` 都使用固定传输参数创建
+`grpc.insecure_channel`，不接受调用方传入的 channel。需要 TLS 或其他自定义 gRPC 连接参数时，
+直接使用 SDK 生成的 gRPC stub。
 
 `OpenEventClient` 和 `AdminClient` 的构造函数都接受 `timeout`，默认值为 30 秒。该值必须是有限且
 大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`，构造和重新赋值使用相同校验。该 deadline 作用于
 全部非流式 RPC。`OpenEventClient.subscribe` 特意不设置 RPC deadline：空闲但健康的订阅会一直保持，
 直到调用方取消、服务端结束或 gRPC 传输失败。
 
-`OpenEventClient` 自己创建的 channel 会对 Subscribe 使用公开的 gRPC 传输层保活策略。这是传输层连通性
+`OpenEventClient` 创建的 channel 会对 Subscribe 使用公开的 gRPC 传输层保活策略。这是传输层连通性
 检查，不是 OpenEvent 消息，因此不会出现在订阅中。连接断开后，订阅会结束；如果注册了完成回调，也会执行，
-不需要等待单个 RPC 的 deadline。通过 `channel=...` 传入的 channel 由调用方拥有和配置；用它订阅时，调用方
-必须设置服务端接受的保活策略。PING 间隔和兼容性要求以 [Subscribe API 契约](API_cn.md#37-subscribe) 为准。
+不需要等待单个 RPC 的 deadline。PING 间隔和兼容性要求以
+[Subscribe API 契约](API_cn.md#37-subscribe) 为准。
 
 client 不再使用时应调用 `client.close()`，也可以把它用作 context manager。`close()` 可以重复调用。
-client 只关闭自己创建的 gRPC channel；通过 `channel=...` 传入的 channel 始终由调用方管理和关闭。
-析构函数只是在遗漏显式关闭时兜底，因为 Python 不保证它何时执行。
+client 会关闭自己创建的 gRPC channel。析构函数只是在遗漏显式关闭时兜底，因为 Python 不保证它何时执行。
 
 ```python
 with OpenEventClient("127.0.0.1:9527") as scoped_client:
@@ -149,9 +149,8 @@ except grpc.RpcError as exc:
 
 `get_seq_by_uuid()` 返回已被 committed 消息消费的 UUID 所对应的 seq。其协议行为以 API 契约 3.3 节为准。
 
-SDK 自建的 gRPC channel 把单条收发消息上限固定为 64 MiB。调用方注入自定义 channel 时必须自行设置
-足够的 `grpc.max_send_message_length` 和 `grpc.max_receive_message_length`；读取旧消息所需的传输上限
-不随当前 payload 写入限制降低，见 [Payload API](API_cn.md#23-payload)。
+SDK 创建的 gRPC channel 把单条收发消息上限固定为 64 MiB。读取旧消息所需的传输上限不随当前
+payload 写入限制降低，见 [Payload API](API_cn.md#23-payload)。
 
 ## 写入和引用对象
 

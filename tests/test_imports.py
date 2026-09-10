@@ -166,18 +166,6 @@ def test_client_closes_owned_channel_once(monkeypatch, client_type) -> None:
 
 
 @pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
-def test_client_does_not_close_injected_channel(monkeypatch, client_type) -> None:
-    channel = _CloseTrackingChannel()
-    _patch_stub_constructors(monkeypatch)
-
-    client = client_type("unused", channel=channel)
-    client.close()
-    client.__del__()
-
-    assert channel.close_calls == 0
-
-
-@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
 def test_client_context_manager_closes_owned_channel(monkeypatch, client_type) -> None:
     channel = _CloseTrackingChannel()
     monkeypatch.setattr(client_module.grpc, "insecure_channel", lambda target, options: channel)
@@ -561,6 +549,7 @@ def test_remaining_wrappers_forward_and_preserve_responses(client_type, method, 
 def test_uuid_pool_refills_in_order_and_is_discarded_on_close(monkeypatch):
     _patch_stub_constructors(monkeypatch)
     channel = _CloseTrackingChannel()
+    monkeypatch.setattr(client_module.grpc, "insecure_channel", lambda target, options: channel)
     calls = []
 
     class Stub:
@@ -572,7 +561,7 @@ def test_uuid_pool_refills_in_order_and_is_discarded_on_close(monkeypatch):
         def GetSeqByUuid(self, request, timeout):
             return openevent_pb2.GetSeqByUuidResponse(seq=0)
 
-    client = OpenEventClient("unused", channel=channel)
+    client = OpenEventClient("unused")
     client.event_stub = Stub()
     assert [client.get_uuid() for _ in range(1025)] == list(range(1, 1026))
     assert calls == [1024, 1024]
@@ -580,4 +569,4 @@ def test_uuid_pool_refills_in_order_and_is_discarded_on_close(monkeypatch):
     assert client.get_uuid() == 1026
     client.close()
     assert not client._uuid_pool
-    assert channel.close_calls == 0
+    assert channel.close_calls == 1

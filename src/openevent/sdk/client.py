@@ -4,7 +4,7 @@ import math
 from collections import deque
 from numbers import Real
 from threading import Event, Lock, Thread
-from typing import Iterable, Optional
+from typing import Iterable
 
 import grpc
 
@@ -95,19 +95,13 @@ class OpenEventClient:
     def __init__(
         self,
         target: str,
-        channel: Optional[grpc.Channel] = None,
         timeout: float = _DEFAULT_RPC_TIMEOUT_SECONDS,
     ):
         self._closed = True
-        self._owns_channel = channel is None
         self._uuid_pool = deque()
         self._uuid_pool_lock = Lock()
         self.timeout = timeout
-        self.channel = (
-            grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
-            if channel is None
-            else channel
-        )
+        self.channel = grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
         self._closed = False
         try:
             self.event_stub = openevent_pb2_grpc.EventServiceStub(self.channel)
@@ -123,7 +117,7 @@ class OpenEventClient:
         self._closed = True
         with self._uuid_pool_lock:
             self._uuid_pool.clear()
-        if getattr(self, "_owns_channel", False):
+        if hasattr(self, "channel"):
             self.channel.close()
 
     def __enter__(self) -> OpenEventClient:

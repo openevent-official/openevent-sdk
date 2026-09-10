@@ -388,7 +388,8 @@ transport activity and closes a connection whose PING acknowledgement does not
 arrive within 10 seconds. It accepts client PINGs no more frequent than every 20
 seconds. The Python high-level client sends client PINGs every 30 seconds and
 does not set a deadline for Subscribe; a caller using another gRPC client or a
-custom channel must configure a compatible transport keepalive policy.
+generated stub must configure a compatible transport keepalive policy on its own
+channel.
 
 When the server begins normal or fatal shutdown, it actively ends every
 established Subscribe stream. Treat this like any other stream interruption:
