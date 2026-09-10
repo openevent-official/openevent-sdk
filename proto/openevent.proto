@@ -130,8 +130,8 @@ message FetchRequest {
 
 message FetchResponse {
     repeated EventMessage messages = 1;
-    uint64 next_seq = 3;
-    uint64 last_seq = 2;
+    uint64 next_seq = 2;
+    uint64 last_seq = 3;
 }
 
 message SubscribeRequest {
