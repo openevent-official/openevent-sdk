@@ -47,7 +47,7 @@
 | `ALREADY_EXISTS` | 资源已存在，例如重复添加成员或 UUID 已被消息使用 |
 | `INVALID_ARGUMENT` | 字段缺失、值非法，或 recipients 不满足成员约束 |
 | `RESOURCE_EXHAUSTED` | payload 超过上限，或对象文件存储空间/quota/inode 不足 |
-| `OUT_OF_RANGE` | ReadObject offset 大于对象大小，或 Subscribe 起点超过 `max_seq` |
+| `OUT_OF_RANGE` | ReadObject offset 大于对象大小，或 Subscribe 起点超过 `max_seq + 1` |
 | `ABORTED` | `Publish.req.seq != max_seq + 1` |
 | `CANCELLED` | 调用被取消；写入结果可能不确定 |
 | `DEADLINE_EXCEEDED` | 调用超过 deadline；写入结果可能不确定 |
@@ -308,14 +308,16 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 | `from_seq` | 行为 |
 |------------|------|
 | `0` | 从 seq 0 开始扫描；是否推送 seq 0 取决于过滤条件 |
-| `> max_seq` | 返回 `OUT_OF_RANGE` |
 | `1..max_seq` | 从该 seq 开始推送可见消息 |
+| `max_seq + 1` | 接受订阅并等待该序号成为已提交消息 |
+| `> max_seq + 1` | 返回 `OUT_OF_RANGE` |
 
-`SubscribeResponse.message` 表示正常消息，包括通过过滤条件的系统初始化消息。起点越过当前尾部时直接
+`SubscribeResponse.message` 表示正常消息，包括通过过滤条件的系统初始化消息。起点超过当前尾部一个
+位置时表示等待下一条消息；超过一个位置才直接
 返回错误；订阅响应只包含消息，不包含游标字段。客户端取消或断开后
-应记录最后已处理 seq；下一 seq 已存在时，从 `seq+1` 重新订阅或 Fetch。如果该 `seq+1` 尚未成为已提交
-消息，Subscribe 返回 `OUT_OF_RANGE`；调用方可以等待 GetStatus 到达该序号，或从最后已处理 seq
-包含式重订阅并过滤重放。扫描到当前尾部后，Subscribe 保持打开并等待后续提交的消息。
+应记录最后已处理 seq，并从 `seq+1` 重新订阅或 Fetch。该序号恰好是当前 `max_seq+1` 时，Subscribe
+保持打开并等待它提交；如果仍超过当前尾部一个以上的位置则返回 `OUT_OF_RANGE`。调用方也可以从最后
+已处理 seq 包含式重订阅并过滤重放。扫描到当前尾部后，Subscribe 保持打开并等待后续提交的消息。
 
 认证、显式 Channel 校验和起点 seq 校验成功后，服务端会在等待或推送任何 OpenEvent 消息之前发送 gRPC 初始响应 metadata。
 即使起点消息或当前全部记录都被过滤，这也表示订阅已被接受。该 metadata 是 gRPC 控制响应，不是
@@ -488,7 +490,8 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
   跳过。
 - next_seq 是下一页建议起点。
 - last_seq 是查询开始时的最大已提交消息序号。
-- ListMessages 起点超过尾部时返回空页和尾部下一位置；Subscribe 起点超过尾部时返回 `OUT_OF_RANGE`。
+- ListMessages 起点超过尾部时返回空页和尾部下一位置。
+  Subscribe 起点等于 `max_seq+1` 时等待新消息，只有超过 `max_seq+1` 才返回 `OUT_OF_RANGE`。
   `next_seq > last_seq` 表示到达本页观察到的尾部。
 - 每页是一致视图，但并发追加可使后续页的 last_seq 增大。
 

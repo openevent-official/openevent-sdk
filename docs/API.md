@@ -57,7 +57,7 @@ recovery, deployment topology, or internal execution mechanisms.
 | `ALREADY_EXISTS` | Resource already exists, such as an existing member or a UUID already used by a message |
 | `INVALID_ARGUMENT` | Missing/invalid fields or invalid recipients |
 | `RESOURCE_EXHAUSTED` | payload exceeds its limit or object-file storage has insufficient space/quota/inodes |
-| `OUT_OF_RANGE` | ReadObject offset is greater than the object size, or Subscribe starts beyond `max_seq` |
+| `OUT_OF_RANGE` | ReadObject offset is greater than the object size, or Subscribe starts beyond `max_seq + 1` |
 | `ABORTED` | `Publish.req.seq != max_seq + 1` |
 | `CANCELLED` | The call was cancelled; a write result may be uncertain |
 | `DEADLINE_EXCEEDED` | The call exceeded its deadline; a write result may be uncertain |
@@ -363,18 +363,20 @@ Deleting the token makes the next batch return `UNAUTHENTICATED` and end the str
 | `from_seq` | Behavior |
 |------------|----------|
 | `0` | Scan from seq 0; seq 0 is pushed only when the filters allow it |
-| `> max_seq` | `OUT_OF_RANGE` |
 | `1..max_seq` | Push visible messages from this seq |
+| `max_seq + 1` | Accept the subscription and wait for that sequence to be committed |
+| `> max_seq + 1` | `OUT_OF_RANGE` |
 
 `SubscribeResponse.message` carries normal messages, including the system
-initialization message when it passes the requested filters. An out-of-range
-starting point is an error; subscription responses contain messages only and
-do not contain a cursor field. After
-disconnect, resume from the last processed `seq + 1` when that sequence already
-exists. If it is beyond the current tail, Subscribe returns `OUT_OF_RANGE`; the
-caller may wait until GetStatus reaches that sequence, or subscribe inclusively
-from the last processed seq and suppress the replay. When a subscription reaches
-its current tail it remains open and waits for later committed messages.
+initialization message when it passes the requested filters. Starting exactly one
+position beyond the current tail waits for the next message; starting farther
+ahead returns `OUT_OF_RANGE`. Subscription responses contain messages only and do
+not contain a cursor field. After disconnect, resume from the last processed
+`seq + 1`. Subscribe waits when that position is the current `max_seq + 1` and
+returns `OUT_OF_RANGE` only when it is farther ahead. A caller may also subscribe
+inclusively from the last processed seq and suppress the replay. When a
+subscription reaches its current tail it remains open and waits for later
+committed messages.
 
 After authentication, explicit Channel validation, and starting-sequence
 validation succeed, the server sends gRPC initial response metadata before it waits for or pushes an OpenEvent
@@ -581,8 +583,8 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 - next_seq is the suggested continuation point.
 - last_seq is the highest committed seq observed when the page starts.
 - A cursor beyond the tail returns an empty page and the tail's next position for
-  ListMessages. Subscribe instead returns `OUT_OF_RANGE` when its starting
-  sequence is beyond the current tail. `next_seq > last_seq` means the page has
+  ListMessages. Subscribe waits when its starting sequence equals `max_seq + 1`
+  and returns `OUT_OF_RANGE` only when it is greater. `next_seq > last_seq` means the page has
   reached its observed tail.
 - Concurrent appends may increase last_seq on later pages.
 

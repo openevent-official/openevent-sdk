@@ -52,7 +52,7 @@ def test_public_imports_and_constants() -> None:
 
     admin_client = AdminClient.__new__(AdminClient)
     admin_client.stub = Stub()
-    admin_client.timeout = 30.0
+    admin_client.timeout_ms = 30_000
     messages = admin_client.list_messages(from_seq=3, limit=8)
     assert captured[0][0].from_seq == 3
     assert captured[0][0].limit == 8
@@ -60,7 +60,7 @@ def test_public_imports_and_constants() -> None:
     assert messages.next_seq == 11
 
 
-def test_client_timeout_is_forwarded_to_unary_rpc() -> None:
+def test_client_timeout_ms_is_converted_to_seconds_for_unary_rpc() -> None:
     class Stub:
         def __init__(self):
             self.timeouts = []
@@ -71,7 +71,7 @@ def test_client_timeout_is_forwarded_to_unary_rpc() -> None:
     client = OpenEventClient.__new__(OpenEventClient)
     stub = Stub()
     client.event_stub = stub
-    client.timeout = 1.25
+    client.timeout_ms = 1_250
     client.get_status(1, "token")
     assert stub.timeouts == [1.25]
 
@@ -102,7 +102,7 @@ def test_get_uuid_refills_the_local_pool_and_forwards_publish_uuid() -> None:
     client.event_stub = stub
     client._uuid_pool = deque()
     client._uuid_pool_lock = Lock()
-    client.timeout = 1.25
+    client.timeout_ms = 1_250
     assert client.get_uuid() == 11
     assert client.get_uuid() == 12
     assert stub.allocate_calls == 1
@@ -114,22 +114,22 @@ def test_get_uuid_refills_the_local_pool_and_forwards_publish_uuid() -> None:
 
 @pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
 @pytest.mark.parametrize(
-    "timeout",
+    "timeout_ms",
     [None, True, False, 0, -1, float("inf"), float("-inf"), float("nan")],
 )
-def test_client_timeout_must_be_finite_and_positive(client_type, timeout) -> None:
-    with pytest.raises(ValueError, match="finite number greater than 0"):
-        client_type("unused", timeout=timeout)
+def test_client_timeout_ms_must_be_finite_and_positive(client_type, timeout_ms) -> None:
+    with pytest.raises(ValueError, match="timeout_ms must be a finite number greater than 0"):
+        client_type("unused", timeout_ms=timeout_ms)
 
     client = client_type.__new__(client_type)
-    with pytest.raises(ValueError, match="finite number greater than 0"):
-        client.timeout = timeout
+    with pytest.raises(ValueError, match="timeout_ms must be a finite number greater than 0"):
+        client.timeout_ms = timeout_ms
 
 
 @pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
-def test_client_timeout_defaults_to_thirty_seconds(client_type) -> None:
+def test_client_timeout_defaults_to_thirty_thousand_milliseconds(client_type) -> None:
     with client_type("127.0.0.1:1") as client:
-        assert client.timeout == 30.0
+        assert client.timeout_ms == 30_000
 
 
 class _CloseTrackingChannel:
@@ -272,7 +272,7 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
     client = OpenEventClient.__new__(OpenEventClient)
     stub = Stub()
     client.event_stub = stub
-    client.timeout = 2.5
+    client.timeout_ms = 2_500
     responses = list(
         client.subscribe(principal=7, token="token", from_seq=2, channels=[11, 12])
     )
@@ -289,7 +289,7 @@ def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
             return ()
 
     ready = client_module._DeduplicatingSubscribeStream(ReadyStream())
-    assert ready.wait_started(1) is None
+    assert ready.wait_started(1_000) is None
 
     release = Event()
 
@@ -309,11 +309,11 @@ def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
     pending_stream = PendingStream()
     pending = client_module._DeduplicatingSubscribeStream(pending_stream)
     with pytest.raises(TimeoutError, match="initial metadata"):
-        pending.wait_started(0.01)
+        pending.wait_started(10)
     assert pending_stream.cancelled
     assert release.wait(1)
 
-    with pytest.raises(ValueError, match="finite number greater than 0"):
+    with pytest.raises(ValueError, match="timeout_ms must be a finite number greater than 0"):
         ready.wait_started(0)
 
     class FailedStream:
@@ -322,7 +322,7 @@ def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
 
     failed = client_module._DeduplicatingSubscribeStream(FailedStream())
     with pytest.raises(RuntimeError, match="subscription rejected"):
-        failed.wait_started(1)
+        failed.wait_started(1_000)
 
 
 def test_proto_service_boundaries_and_admin_field_numbers() -> None:
@@ -449,7 +449,7 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
     client = OpenEventClient.__new__(OpenEventClient)
     client.event_stub = EventStub()
     client.object_stub = ObjectStub()
-    client.timeout = 4.5
+    client.timeout_ms = 4_500
     first = openevent_pb2.ObjectKey(object_id=1, object_token="first")
     second = openevent_pb2.ObjectKey(object_id=2, object_token="second")
 
@@ -535,7 +535,7 @@ def test_remaining_wrappers_forward_and_preserve_responses(client_type, method, 
         return response
 
     client = client_type.__new__(client_type)
-    client.timeout = 1.75
+    client.timeout_ms = 1_750
     setattr(client, stub_name, SimpleNamespace(**{rpc: call}))
     wrapper = getattr(client, method)
     assert wrapper(*args, **kwargs) is response

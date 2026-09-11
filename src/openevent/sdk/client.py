@@ -17,7 +17,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 _DEFAULT_MAX_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024
-_DEFAULT_RPC_TIMEOUT_SECONDS = 30.0
+_DEFAULT_RPC_TIMEOUT_MS = 30_000.0
 _SUBSCRIBE_KEEPALIVE_TIME_MS = 30_000
 _SUBSCRIBE_KEEPALIVE_TIMEOUT_MS = 10_000
 _UUID_POOL_BATCH_SIZE = 1024
@@ -31,12 +31,12 @@ _DEFAULT_CHANNEL_OPTIONS = (
 )
 
 
-def _validate_rpc_timeout(timeout: object) -> float:
-    if isinstance(timeout, bool) or not isinstance(timeout, Real):
-        raise ValueError("timeout must be a finite number greater than 0")
-    value = float(timeout)
+def _validate_timeout_ms(timeout_ms: object) -> float:
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, Real):
+        raise ValueError("timeout_ms must be a finite number greater than 0")
+    value = float(timeout_ms)
     if not math.isfinite(value) or value <= 0:
-        raise ValueError("timeout must be a finite number greater than 0")
+        raise ValueError("timeout_ms must be a finite number greater than 0")
     return value
 
 
@@ -62,9 +62,9 @@ class _DeduplicatingSubscribeStream:
                 self._last_seq = seq
             return item
 
-    def wait_started(self, timeout: object) -> None:
-        """Wait for the server to accept the subscription without giving it a deadline."""
-        timeout_seconds = _validate_rpc_timeout(timeout)
+    def wait_started(self, timeout_ms: object) -> None:
+        """Wait up to timeout_ms for server acceptance without setting a stream deadline."""
+        timeout_seconds = _validate_timeout_ms(timeout_ms) / 1000.0
         with self._started_lock:
             if not self._started_waiter_started:
                 self._started_waiter_started = True
@@ -95,12 +95,12 @@ class OpenEventClient:
     def __init__(
         self,
         target: str,
-        timeout: float = _DEFAULT_RPC_TIMEOUT_SECONDS,
+        timeout_ms: float = _DEFAULT_RPC_TIMEOUT_MS,
     ):
         self._closed = True
         self._uuid_pool = deque()
         self._uuid_pool_lock = Lock()
-        self.timeout = timeout
+        self.timeout_ms = timeout_ms
         self.channel = grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
         self._closed = False
         try:
@@ -134,17 +134,21 @@ class OpenEventClient:
             pass
 
     @property
-    def timeout(self) -> float:
-        return self._timeout
+    def timeout_ms(self) -> float:
+        return self._timeout_ms
 
-    @timeout.setter
-    def timeout(self, value: object) -> None:
-        self._timeout = _validate_rpc_timeout(value)
+    @timeout_ms.setter
+    def timeout_ms(self, value: object) -> None:
+        self._timeout_ms = _validate_timeout_ms(value)
+
+    @property
+    def _rpc_timeout_seconds(self) -> float:
+        return self._timeout_ms / 1000.0
 
     def get_status(self, principal: int, token: str):
         return self.event_stub.GetStatus(
             openevent_pb2.GetStatusRequest(principal=principal, token=token),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def get_uuid(self) -> int:
@@ -152,7 +156,7 @@ class OpenEventClient:
             if not self._uuid_pool:
                 response = self.event_stub.AllocateUuids(
                     openevent_pb2.AllocateUuidsRequest(count=_UUID_POOL_BATCH_SIZE),
-                    timeout=self.timeout,
+                    timeout=self._rpc_timeout_seconds,
                 )
                 if len(response.uuids) != _UUID_POOL_BATCH_SIZE:
                     raise RuntimeError("server returned an incomplete UUID allocation batch")
@@ -162,7 +166,7 @@ class OpenEventClient:
     def get_seq_by_uuid(self, uuid: int) -> int:
         response = self.event_stub.GetSeqByUuid(
             openevent_pb2.GetSeqByUuidRequest(uuid=uuid),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
         return response.seq
 
@@ -188,7 +192,7 @@ class OpenEventClient:
                 object_keys=list(object_keys),
                 uuid=uuid,
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def publish_auto_seq(
@@ -211,7 +215,7 @@ class OpenEventClient:
                 object_keys=list(object_keys),
                 uuid=uuid,
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def fetch(
@@ -232,7 +236,7 @@ class OpenEventClient:
                 channels=list(channels),
                 only_my_recipient=only_my_recipient,
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def subscribe(
@@ -273,7 +277,7 @@ class OpenEventClient:
                 description=description,
                 data=data,
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def get_object_metadata(self, object_id: int, object_token: str):
@@ -282,7 +286,7 @@ class OpenEventClient:
                 object_id=object_id,
                 object_token=object_token,
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def read_object(self, object_id: int, object_token: str, offset: int, nbytes: int):
@@ -293,7 +297,7 @@ class OpenEventClient:
                 offset=offset,
                 nbytes=nbytes,
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def create_channel(
@@ -316,13 +320,13 @@ class OpenEventClient:
                 description=description,
                 members=list(members),
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def get_channel(self, principal: int, token: str, channel_id: int):
         return self.channel_stub.GetChannel(
             openevent_pb2.GetChannelRequest(principal=principal, token=token, channel_id=channel_id),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def list_channels(
@@ -333,7 +337,7 @@ class OpenEventClient:
     ):
         return self.channel_stub.ListChannels(
             openevent_pb2.ListChannelsRequest(principal=principal, token=token, filter=filter),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def add_member(self, principal: int, token: str, channel_id: int, target_principal: int):
@@ -344,7 +348,7 @@ class OpenEventClient:
                 channel_id=channel_id,
                 target_principal=target_principal,
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )
 
     def remove_member(self, principal: int, token: str, channel_id: int, target_principal: int):
@@ -355,5 +359,5 @@ class OpenEventClient:
                 channel_id=channel_id,
                 target_principal=target_principal,
             ),
-            timeout=self.timeout,
+            timeout=self._rpc_timeout_seconds,
         )

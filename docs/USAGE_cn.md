@@ -36,9 +36,9 @@ token = "user-token"
 `grpc.insecure_channel`，不接受调用方传入的 channel。需要 TLS 或其他自定义 gRPC 连接参数时，
 直接使用 SDK 生成的 gRPC stub。
 
-`OpenEventClient` 和 `AdminClient` 的构造函数都接受 `timeout`，默认值为 30 秒。该值必须是有限且
-大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`，构造和重新赋值使用相同校验。该 deadline 作用于
-全部非流式 RPC。`OpenEventClient.subscribe` 特意不设置 RPC deadline：空闲但健康的订阅会一直保持，
+`OpenEventClient` 和 `AdminClient` 的构造函数都接受 `timeout_ms`，默认值为 30000 毫秒（30 秒）。该值必须是有限且
+大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`，构造和重新赋值使用相同校验。SDK 会把它换算成秒传给
+gRPC 的非流式 RPC 调用。`OpenEventClient.subscribe` 特意不设置 RPC deadline：空闲但健康的订阅会一直保持，
 直到调用方取消、服务端结束或 gRPC 传输失败。
 
 `OpenEventClient` 创建的 channel 会对 Subscribe 使用公开的 gRPC 传输层保活策略。这是传输层连通性
@@ -239,7 +239,7 @@ response = client.fetch(
 
 ## 订阅消息
 
-`subscribe` 返回兼容 gRPC stream 的迭代器；它提供 `cancel()` 和 `wait_started(timeout)`，同时执行下述
+`subscribe` 返回兼容 gRPC stream 的迭代器；它提供 `cancel()` 和 `wait_started(timeout_ms)`，同时执行下述
 SDK 序号检查：
 
 ```python
@@ -253,8 +253,8 @@ for item in client.subscribe(
     print(message.seq, message.payload)
 ```
 
-`wait_started(timeout)` 等待服务端发送初始响应 metadata。调用方需要区分“服务端已经接受订阅”和“仍在尝试
-建立连接”时可使用它。`timeout` 必须是大于 0 的有限秒数；超时会取消本次 stream 并抛出 `TimeoutError`。
+`wait_started(timeout_ms)` 等待服务端发送初始响应 metadata。调用方需要区分“服务端已经接受订阅”和“仍在尝试
+建立连接”时可使用它。`timeout_ms` 必须是大于 0 的有限毫秒数；超时会取消本次 stream 并抛出 `TimeoutError`。
 服务端接受前发生的 RPC 错误原样抛出。成功返回不为已经建立的 stream 设置 deadline，也不等待任何
 OpenEvent 消息。
 

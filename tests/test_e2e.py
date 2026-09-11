@@ -611,8 +611,28 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
 
     max_seq = client.get_status(principal=principal, token=token).max_seq
     boundary = client.subscribe(principal=principal, token=token, from_seq=max_seq + 1)
+    boundary.wait_started(5_000)
+    executor = ThreadPoolExecutor(max_workers=1)
+    pending = executor.submit(next, boundary)
+    try:
+        boundary_seq = client.publish_auto_seq(
+            principal=principal,
+            token=token,
+            channel_id=channel_id,
+            payload=b"subscribe boundary",
+            uuid=_uuid(client),
+        ).seq
+        boundary_item = pending.result(timeout=5)
+        assert boundary_item.message.seq == boundary_seq
+        assert boundary_item.message.payload == b"subscribe boundary"
+    finally:
+        boundary.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    too_far = client.get_status(principal=principal, token=token).max_seq + 2
+    invalid_boundary = client.subscribe(principal=principal, token=token, from_seq=too_far)
     with pytest.raises(grpc.RpcError) as exc_info:
-        boundary.wait_started(5)
+        invalid_boundary.wait_started(5_000)
     _assert_rpc_code(exc_info, grpc.StatusCode.OUT_OF_RANGE)
 
 
@@ -704,7 +724,7 @@ def test_subscribe_wait_started_before_selected_channel_message(
     )
     executor = ThreadPoolExecutor(max_workers=1)
     try:
-        stream.wait_started(5)
+        stream.wait_started(5_000)
         pending = executor.submit(next, stream)
         time.sleep(0.1)
         assert not pending.done()
@@ -732,7 +752,7 @@ def test_subscribe_keepalive_closes_a_silently_dropped_transport(admin: AdminCli
     stream = client.subscribe(principal=principal, token=token, from_seq=0)
     executor = ThreadPoolExecutor(max_workers=1)
     try:
-        stream.wait_started(5)
+        stream.wait_started(5_000)
         assert next(stream).message.seq == 0
         pending = executor.submit(next, stream)
         time.sleep(0.1)
@@ -1174,7 +1194,7 @@ def test_system_initialization_and_zero_start(admin, client):
     assert not client.fetch(2001, token, 0, 1, channels=[channel]).messages
     stream = client.subscribe(2001, token)
     try:
-        stream.wait_started(5)
+        stream.wait_started(5_000)
         assert next(stream).message == message
     finally:
         stream.cancel()
@@ -1255,7 +1275,7 @@ def test_subscription_observes_member_removal_and_token_deletion(admin, client, 
     start = client.publish_auto_seq(owner, owner_token, private, b"before", client.get_uuid()).seq
     stream = client.subscribe(member, member_token, from_seq=start, channels=[private] if explicit else [])
     try:
-        stream.wait_started(5)
+        stream.wait_started(5_000)
         assert next(stream).message.seq == start
         client.remove_member(owner, owner_token, private, member)
         if visibility == 2 and explicit:
@@ -1375,13 +1395,13 @@ def test_wait_started_distinguishes_acceptance_from_rejection(admin, client):
     for fields, expected in [
         ({"principal": 0, "token": token}, grpc.StatusCode.INVALID_ARGUMENT),
         ({"principal": 2701, "token": "wrong"}, grpc.StatusCode.UNAUTHENTICATED),
-        ({"principal": 2701, "token": token, "from_seq": 1}, grpc.StatusCode.OUT_OF_RANGE),
+        ({"principal": 2701, "token": token, "from_seq": 2}, grpc.StatusCode.OUT_OF_RANGE),
         ({"principal": 2701, "token": token, "channels": [999]}, grpc.StatusCode.NOT_FOUND),
     ]:
         stream = client.subscribe(**fields)
         try:
             with pytest.raises(grpc.RpcError) as error:
-                stream.wait_started(5)
+                stream.wait_started(5_000)
             assert error.value.code() == expected
         finally:
             stream.cancel()
@@ -1393,7 +1413,7 @@ def test_wait_started_distinguishes_acceptance_from_rejection(admin, client):
         stream.add_done_callback(lambda _: ended.set())
         admin.delete_token(token)
         assert ended.wait(5)
-        assert stream.wait_started(5) is None
+        assert stream.wait_started(5_000) is None
         with pytest.raises(grpc.RpcError) as error:
             next(stream)
         assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED

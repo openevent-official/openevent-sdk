@@ -38,11 +38,11 @@ token = "user-token"
 a caller-provided channel. Use the generated gRPC stubs directly when TLS or
 other custom gRPC connection options are required.
 
-`OpenEventClient` and `AdminClient` accept a constructor `timeout` with a
-30-second default. It must be a finite number greater than zero; `None`, boolean,
-zero, negative, NaN, and infinite values raise `ValueError`, both at construction
-and on reassignment. The deadline applies
-to every non-streaming RPC. `OpenEventClient.subscribe` deliberately has no RPC
+`OpenEventClient` and `AdminClient` accept a constructor `timeout_ms` with a
+30000-millisecond (30-second) default. It must be a finite number greater than
+zero; `None`, boolean, zero, negative, NaN, and infinite values raise `ValueError`,
+both at construction and on reassignment. The SDK converts this value to seconds
+for every non-streaming gRPC call. `OpenEventClient.subscribe` deliberately has no RPC
 deadline: an idle, healthy subscription remains open until the caller cancels it,
 the server ends it, or the gRPC transport fails.
 
@@ -262,7 +262,7 @@ response = client.fetch(
 ## Subscribe to Messages
 
 `subscribe` returns a stream-compatible iterator. It provides `cancel()` and
-`wait_started(timeout)`, while applying the SDK sequence check described below:
+`wait_started(timeout_ms)`, while applying the SDK sequence check described below:
 
 ```python
 for item in client.subscribe(
@@ -275,10 +275,11 @@ for item in client.subscribe(
     print(message.seq, message.payload)
 ```
 
-`wait_started(timeout)` waits for the server's initial response metadata. It is
+`wait_started(timeout_ms)` waits for the server's initial response metadata. It is
 useful when a caller must distinguish a subscription accepted by the server from
-one that is still trying to connect. `timeout` must be a finite number of seconds
-greater than zero. On timeout, it cancels this stream and raises `TimeoutError`.
+one that is still trying to connect. `timeout_ms` must be a finite number of
+milliseconds greater than zero. On timeout, it cancels this stream and raises
+`TimeoutError`.
 An RPC error before acceptance is propagated unchanged. A successful return does
 not impose a deadline on the established stream and does not wait for an
 OpenEvent message.

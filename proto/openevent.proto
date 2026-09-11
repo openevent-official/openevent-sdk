@@ -137,7 +137,7 @@ message FetchResponse {
 message SubscribeRequest {
     uint64 principal = 1;
     string token = 2;
-    uint64 from_seq = 3;          // Inclusive starting sequence; 0 starts from the system initialization message
+    uint64 from_seq = 3;          // Inclusive start; 0 starts at initialization, max_seq + 1 waits for the next message
     bool only_my_recipient = 4;   // If true, push only messages whose recipients contain principal
     repeated uint64 channels = 5; // Explicit IDs must exist and be readable; empty selects all readable Channels
 }
