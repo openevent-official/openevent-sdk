@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 
 import pytest
 
@@ -163,6 +163,60 @@ def test_client_closes_owned_channel_once(monkeypatch, client_type) -> None:
     client.__del__()
 
     assert channel.close_calls == 1
+
+
+def test_close_cancels_pending_uuid_allocation_before_waiting_for_its_lock(monkeypatch) -> None:
+    allocation_started = Event()
+    allocation_cancelled = Event()
+    channel_closed = Event()
+    allocation_errors = []
+    cancelled_error = client_module.grpc.RpcError("allocation cancelled")
+
+    class Channel(_CloseTrackingChannel):
+        def close(self):
+            super().close()
+            channel_closed.set()
+            allocation_cancelled.set()
+
+    class Stub:
+        def AllocateUuids(self, request, timeout):
+            allocation_started.set()
+            if not allocation_cancelled.wait(5):
+                raise TimeoutError("allocation was not cancelled")
+            raise cancelled_error
+
+    channel = Channel()
+    monkeypatch.setattr(client_module.grpc, "insecure_channel", lambda target, options: channel)
+    _patch_stub_constructors(monkeypatch)
+    client = OpenEventClient("unused")
+    client.event_stub = Stub()
+
+    def allocate():
+        try:
+            client.get_uuid()
+        except Exception as exc:
+            allocation_errors.append(exc)
+
+    allocator = Thread(target=allocate)
+    closer = Thread(target=client.close)
+    allocator.start()
+    try:
+        assert allocation_started.wait(2)
+        closer.start()
+        assert channel_closed.wait(2), "close waited for the pending allocation before cancelling it"
+        allocator.join(2)
+        closer.join(2)
+        assert not allocator.is_alive()
+        assert not closer.is_alive()
+        assert allocation_errors == [cancelled_error]
+        assert not client._uuid_pool
+        assert channel.close_calls == 1
+    finally:
+        allocation_cancelled.set()
+        allocator.join(5)
+        if closer.ident is not None:
+            closer.join(5)
+        client.close()
 
 
 @pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])

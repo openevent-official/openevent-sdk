@@ -17,7 +17,7 @@ help:
 	@printf '  PYTHON=%s\n' '$(PYTHON)'
 	@printf '  INSTALL_ARGS=%s\n' '$(INSTALL_ARGS)'
 	@printf '\nExamples:\n'
-	@printf '  make install INSTALL_ARGS="--target /opt/openevent-sdk"\n'
+	@printf '  make install PYTHON=/opt/openevent-sdk/bin/python\n'
 
 init:
 	./generate_python_proto.sh
@@ -26,12 +26,7 @@ build:
 	PYTHON="$(PYTHON)" ./build.sh
 
 install: build
-	@wheel="$$(find "dist" -maxdepth 1 -type f -name '*.whl' | sort | tail -n 1)"; \
-	if [ -z "$$wheel" ]; then \
-	  printf 'no wheel found in dist\n'; \
-	  exit 1; \
-	fi; \
-	PYTHONDONTWRITEBYTECODE=1 "$(PYTHON)" -m pip install --no-compile $(INSTALL_ARGS) "$$wheel"
+	PYTHONDONTWRITEBYTECODE=1 "$(PYTHON)" scripts/install.py $(INSTALL_ARGS)
 
 test:
 	PYTHON="$(PYTHON)" ./test.sh $(TEST_ARGS)

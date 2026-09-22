@@ -115,10 +115,11 @@ class OpenEventClient:
         if getattr(self, "_closed", True):
             return
         self._closed = True
-        with self._uuid_pool_lock:
-            self._uuid_pool.clear()
+        # Cancel in-flight RPCs before waiting for a UUID refill to release its lock.
         if hasattr(self, "channel"):
             self.channel.close()
+        with self._uuid_pool_lock:
+            self._uuid_pool.clear()
 
     def __enter__(self) -> OpenEventClient:
         return self

@@ -24,6 +24,8 @@ openevent-sdk/
 ├── Makefile
 ├── build.sh
 ├── generate_python_proto.sh
+├── scripts/
+│   └── install.py
 ├── test.sh
 ├── src/
 │   └── openevent/
@@ -58,7 +60,7 @@ make build
 构建完成后，wheel 位于：
 
 ```text
-dist/openevent_sdk-0.8.0-py3-none-any.whl
+dist/openevent_sdk-0.8.1-py3-none-any.whl
 ```
 
 构建并安装生成的 wheel：
@@ -67,12 +69,18 @@ dist/openevent_sdk-0.8.0-py3-none-any.whl
 make install
 ```
 
-需要指定安装路径时，通过 `INSTALL_ARGS` 传递 `pip install` 参数：
+安装只使用本次成功构建的 wheel。先按 wheel 声明检查依赖，复用已满足要求的依赖，
+然后只替换 SDK 本身；即使版本号没有变化，新代码也会生效。
+
+通过 `PYTHON` 选择已有的虚拟环境：
 
 ```bash
-make install INSTALL_ARGS="--target /opt/openevent-sdk"
-make install INSTALL_ARGS="--prefix /opt/openevent-sdk"
+make install PYTHON=/opt/openevent-sdk/bin/python
 ```
+
+`INSTALL_ARGS` 可传递 `--no-index`、`--find-links` 等普通 `pip install` 参数。
+不支持通过 `--target`/`-t`、`--prefix`、`--root` 或 `PIP_TARGET`、`PIP_PREFIX`、`PIP_ROOT`
+改变安装位置；请改用 `PYTHON` 选择环境。
 
 运行 SDK 单元测试（生成协议并在测试专用环境中安装待测包）：
 

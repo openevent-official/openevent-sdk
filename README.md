@@ -27,6 +27,8 @@ openevent-sdk/
 ├── Makefile
 ├── build.sh
 ├── generate_python_proto.sh
+├── scripts/
+│   └── install.py
 ├── test.sh
 ├── src/
 │   └── openevent/
@@ -64,7 +66,7 @@ make build
 The wheel is written to:
 
 ```text
-dist/openevent_sdk-0.8.0-py3-none-any.whl
+dist/openevent_sdk-0.8.1-py3-none-any.whl
 ```
 
 Build and install the generated wheel:
@@ -73,13 +75,19 @@ Build and install the generated wheel:
 make install
 ```
 
-Pass `pip install` options through `INSTALL_ARGS` when a custom install path is
-needed:
+Installation uses only the wheel from the successful build. It checks the wheel's
+declared dependencies, reuses compatible installed dependencies, and then replaces
+only the SDK itself, even when its version is unchanged.
+
+Choose an existing virtual environment with `PYTHON`:
 
 ```bash
-make install INSTALL_ARGS="--target /opt/openevent-sdk"
-make install INSTALL_ARGS="--prefix /opt/openevent-sdk"
+make install PYTHON=/opt/openevent-sdk/bin/python
 ```
+
+`INSTALL_ARGS` accepts ordinary `pip install` options, such as `--no-index` and
+`--find-links`. Changing the destination with `--target`/`-t`, `--prefix`, `--root`,
+or `PIP_TARGET`, `PIP_PREFIX`, `PIP_ROOT` is not supported; use `PYTHON` instead.
 
 Run SDK unit tests, generating the protocol and installing the package in a test-only directory:
 

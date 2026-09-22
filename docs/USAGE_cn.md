@@ -7,12 +7,13 @@
 
 ## 安装
 
-从本仓库构建 wheel：
+从本仓库构建并安装：
 
 ```bash
-make build
-python3 -m pip install dist/openevent_sdk-0.8.0-py3-none-any.whl
+make install
 ```
+
+选择 Python 环境和安装参数的方法见 [README 的构建和测试说明](../README_cn.md#构建和测试)。
 
 开发本仓库时，可以直接生成 protobuf 代码并使用源码：
 
@@ -47,7 +48,8 @@ gRPC 的非流式 RPC 调用。`OpenEventClient.subscribe` 特意不设置 RPC d
 [Subscribe API 契约](API_cn.md#37-subscribe) 为准。
 
 client 不再使用时应调用 `client.close()`，也可以把它用作 context manager。`close()` 可以重复调用。
-client 会关闭自己创建的 gRPC channel。析构函数只是在遗漏显式关闭时兜底，因为 Python 不保证它何时执行。
+client 会关闭自己创建的 gRPC channel，取消尚未完成的 RPC，并丢弃未使用的 UUID。
+关闭连接不需要先等 UUID 分配请求完成。析构函数只是在遗漏显式关闭时兜底，因为 Python 不保证它何时执行。
 
 ```python
 with OpenEventClient("127.0.0.1:9527") as scoped_client:

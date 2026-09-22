@@ -8,12 +8,14 @@ in Python projects. Protocol fields and boundary semantics are defined by
 
 ## Install
 
-Build a wheel from this repository:
+Build and install from this repository:
 
 ```bash
-make build
-python3 -m pip install dist/openevent_sdk-0.8.0-py3-none-any.whl
+make install
 ```
+
+See [Build and Test in the README](../README.md#build-and-test) for Python environment selection
+and installation arguments.
 
 For local development, generate protobuf code and use the source tree directly:
 
@@ -55,8 +57,10 @@ compatibility requirements are in the [Subscribe API contract](API.md#37-subscri
 
 Call `client.close()` when the client is no longer needed, or use it as a
 context manager. `close()` is idempotent and closes the gRPC channel created by
-the client. The destructor is only a fallback for an omitted explicit close
-because Python does not guarantee when it runs.
+the client, cancelling pending RPCs and discarding unused UUIDs. Closing the
+connection does not wait for a UUID allocation request to finish first. The
+destructor is only a fallback for an omitted explicit close because Python does
+not guarantee when it runs.
 
 ```python
 with OpenEventClient("127.0.0.1:9527") as scoped_client:
