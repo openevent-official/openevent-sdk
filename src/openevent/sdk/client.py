@@ -40,7 +40,7 @@ def _validate_timeout_ms(timeout_ms: object) -> float:
     return value
 
 
-class _DeduplicatingSubscribeStream:
+class _SubscribeStream:
     def __init__(self, stream):
         self._stream = stream
         self._last_seq = None
@@ -53,14 +53,17 @@ class _DeduplicatingSubscribeStream:
         return self
 
     def __next__(self):
-        while True:
-            item = next(self._stream)
-            if item.HasField("message"):
-                seq = item.message.seq
-                if self._last_seq is not None and seq <= self._last_seq:
-                    continue
-                self._last_seq = seq
-            return item
+        item = next(self._stream)
+        if item.HasField("message"):
+            seq = item.message.seq
+            if self._last_seq is not None and seq <= self._last_seq:
+                self.cancel()
+                raise RuntimeError(
+                    "Subscribe message seq must strictly increase: "
+                    f"previous={self._last_seq}, received={seq}"
+                )
+            self._last_seq = seq
+        return item
 
     def wait_started(self, timeout_ms: object) -> None:
         """Wait up to timeout_ms for server acceptance without setting a stream deadline."""
@@ -258,7 +261,7 @@ class OpenEventClient:
             ),
             timeout=None,
         )
-        return _DeduplicatingSubscribeStream(stream)
+        return _SubscribeStream(stream)
 
     def write_object(
         self,

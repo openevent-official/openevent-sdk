@@ -60,15 +60,15 @@ class AdminClient:
     def _rpc_timeout_seconds(self) -> float:
         return self._timeout_ms / 1000.0
 
-    def add_token(self, target_principal: int):
+    def add_token(self, principal: int):
         return self.stub.AddToken(
-            admin_pb2.AddTokenRequest(target_principal=target_principal),
+            admin_pb2.AddTokenRequest(principal=principal),
             timeout=self._rpc_timeout_seconds,
         )
 
-    def delete_token(self, target_token: str):
+    def delete_token(self, principal: int, token: str):
         return self.stub.DeleteToken(
-            admin_pb2.DeleteTokenRequest(target_token=target_token),
+            admin_pb2.DeleteTokenRequest(principal=principal, token=token),
             timeout=self._rpc_timeout_seconds,
         )
 

@@ -6,8 +6,7 @@
 > Scope: the initialization message persisted by OpenEvent for the system Channel
 
 This document defines the public `system.v1` protocol for the reserved system
-Channel. It follows the same payload-envelope style as the other OpenEvent
-business protocols. The OpenEvent API and gRPC status semantics are defined by
+Channel. The OpenEvent API and gRPC status semantics are defined by
 the [API contract](API.md).
 
 ## 1. Protocol Boundary
@@ -19,8 +18,7 @@ data root. That message is retained permanently.
 
 The system message is an ordinary `EventMessage` for reading, scanning,
 pagination, and subscription. Its reserved field values identify the system
-record; its payload identifies the protocol kind. No protobuf field or enum is
-added for this protocol.
+record; its payload identifies the protocol kind.
 
 ## 2. System Channel
 
@@ -68,8 +66,7 @@ Field rules:
 
 The payload does not contain `seq`, `channel_id`, `principal`, or `uuid`.
 Those values are carried by the enclosing `EventMessage`.
-`data.schema_version` versions this public system payload schema; it is not the
-server's private storage-layout version.
+`data.schema_version` versions this system payload schema.
 
 ## 4. Initialization Message
 
@@ -91,17 +88,10 @@ MUST be equal, and are set by the server. Initialization completes only after
 the message is durably committed. The server MUST create it exactly once for a
 new data root, retain it permanently, and never recreate it on restart.
 
-The server MUST reject startup if an existing data root does not contain the
-valid seq-0 initialization message and its corresponding UUID lookup mapping. A
-missing, malformed, or conflicting system message is persistent storage
-corruption, not an empty event log.
-
 ## 5. Reserved Principal and UUID
 
-`principal=0` is reserved for the OpenEvent system itself. Business principals
-MUST be greater than zero. Clients MUST NOT use zero as a token-binding
-principal, business RPC principal, Channel creator or member, recipient, object
-creator, or published-message principal.
+`principal=0` is reserved for the OpenEvent system. Business principals are
+positive integers; see [basic conventions](API.md#1-basic-conventions).
 
 The initialization message uses `uuid=0` and participates in normal UUID
 lookup: `GetSeqByUuid(0)` returns `seq=0`. UUID 0 is otherwise not available for
@@ -109,17 +99,10 @@ client allocation or publishing.
 
 ## 6. Sequence and Reads
 
-The event sequence always contains at least the system initialization message.
-After initialization:
+`min_seq=0`; `max_seq=0` means only the initialization message exists.
+Application messages begin at `seq=1`; see [message sequence](API.md#22-message-sequence).
 
-- `min_seq=0`;
-- `max_seq=0` means that only the initialization message exists;
-- application messages begin at `seq=1`;
-- committed sequence values are never reused.
-
-All message readers use inclusive sequence cursors. `from_seq=0` starts scanning
-at seq 0. Each reader then applies its own normal filtering and pagination rules,
-so whether seq 0 appears in a response depends on that request and reader.
+`from_seq=0` includes the initialization message when it matches the request's filters.
 
 Starting-sequence, pagination, and error rules for each reader are defined in
 [Fetch](API.md#36-fetch), [Subscribe](API.md#37-subscribe), and

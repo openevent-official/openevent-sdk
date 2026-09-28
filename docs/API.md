@@ -2,39 +2,31 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.8.0
-> Date: 2026-09-08
+> Version: 0.10.0
+> Date: 2026-09-28
 
 This document defines the public behavior of the business protocol
 [`proto/openevent.proto`](../proto/openevent.proto) and management protocol
-[`proto/admin.proto`](../proto/admin.proto). It does not define server storage,
-recovery, deployment topology, or internal execution mechanisms.
+[`proto/admin.proto`](../proto/admin.proto).
 
 ## 1. Basic Conventions
 
 - All APIs use `gRPC + Protocol Buffers`.
-- Clients use `seq` as the global message position and do not maintain a separate
-  message-storage offset.
 - A valid initialized server always contains the permanent system initialization
   message at `seq=0`; application messages start at `seq=1`.
-- Committed `seq` values increase monotonically and are not reused. Application
-  messages advance from the current `max_seq + 1`.
 - Each application `EventMessage` contains `ts_ms`, the Unix millisecond
   timestamp when the server received the publish request. For seq 0 it is the
   initialization event time defined by `system.v1`.
 - Each application `EventMessage` contains a nonzero `uuid` allocated by
   `AllocateUuids`. The system initialization message is the sole exception and
   uses `uuid=0` and `principal=0`.
-- Application `payload` is opaque bytes; OpenEvent does not parse or validate
-  its business schema. The server-generated seq-0 system payload follows the
+- Application `payload` is stored as opaque bytes. The server-generated seq-0 system payload follows the
   separate `system.v1` protocol.
 - Business principals must be greater than zero. `principal=0` is reserved for
-  server-generated system behavior; a business request that supplies zero in a
-  principal, token-binding principal, Channel creator/member, recipient, or
-  object-creator position returns `INVALID_ARGUMENT`.
-- OpenEvent retains all committed messages, Channel metadata, and immutable objects.
-  Message/object deletion, retention periods, history compaction, and background
-  garbage collection are not provided. This is the chosen retention policy for the current version.
+  server-generated system behavior. Zero in a business or token-management request
+  principal, Channel creator/member, recipient, or object-creator position returns
+  `INVALID_ARGUMENT`.
+- OpenEvent permanently retains committed messages, Channel metadata, and immutable objects.
 
 ### 1.1 Services
 
@@ -51,7 +43,7 @@ recovery, deployment topology, or internal execution mechanisms.
 
 | Status | Meaning |
 |--------|---------|
-| `UNAUTHENTICATED` | token is missing, invalid, or not bound to `principal` |
+| `UNAUTHENTICATED` | the request's `principal + token` pair is invalid |
 | `PERMISSION_DENIED` | ACL check failed or the operation is not allowed |
 | `NOT_FOUND` | Channel does not exist, or an object capability is absent or invalid |
 | `ALREADY_EXISTS` | Resource already exists, such as an existing member or a UUID already used by a message |
@@ -62,24 +54,25 @@ recovery, deployment topology, or internal execution mechanisms.
 | `CANCELLED` | The call was cancelled; a write result may be uncertain |
 | `DEADLINE_EXCEEDED` | The call exceeded its deadline; a write result may be uncertain |
 | `UNAVAILABLE` | Service or dependency is unavailable |
-| `DATA_LOSS` | Persistent storage is corrupt; the server exits rather than serve partial state |
+| `DATA_LOSS` | Persistent storage is corrupt; the server exits |
 | `INTERNAL` | Unexpected error |
 
 The object-storage part of `RESOURCE_EXHAUSTED` covers only space, quota, or inode
-exhaustion during object-file writes, syncs, or cleanup. RocksDB write failures do
-not use this status; they return `UNAVAILABLE` as storage-availability failures and
-trigger server shutdown.
+exhaustion during object-file writes, syncs, or cleanup. Metadata storage write
+failures return `UNAVAILABLE` and trigger server shutdown.
 
 A fatal storage failure stops new calls and causes a nonzero process exit. The
 triggering RPC makes a best effort to return its original error: `DATA_LOSS` for
 corruption or `UNAVAILABLE` for other fatal storage failures. Ordinary RPCs that
 have begun execution may finish; active subscriptions are ended.
 
+Handle errors by gRPC status code.
+
 ### 2.2 Message Sequence
 
 - `EventMessage.seq` is a globally monotonically increasing message sequence.
-- `seq=0` is the permanent system initialization message, not an empty-sequence
-  sentinel. `min_seq=0` and `max_seq=0` mean that only this message exists.
+- `seq=0` is the permanent system initialization message. `min_seq=0` and
+  `max_seq=0` mean that only this message exists.
 - Committed values are not reused.
 - Application message seq values advance from `max_seq + 1`. Readers continue
   with the cursor returned by the server.
@@ -90,11 +83,8 @@ have begun execution may finish; active subscriptions are ended.
 - `Publish` and `PublishAutoSeq` accept payload, which may be empty.
 - The deployment's `max_payload_bytes` setting limits only publish request payloads.
 - Oversized payload returns `RESOURCE_EXHAUSTED` and creates no message.
-- Reads of committed messages are independent of the current write limit. After
-  lowering the setting and restarting, Fetch, Subscribe, and administrative
-  ListMessages must still return complete historical payloads without rejecting,
-  skipping, or truncating them because they exceed the new write limit. Page
-  budgets determine only page boundaries.
+- Fetch, Subscribe, and administrative ListMessages return complete historical
+  payloads even after the write limit is lowered. Page budgets determine page boundaries.
 
 ### 2.4 Message UUIDs
 
@@ -108,8 +98,7 @@ have begun execution may finish; active subscriptions are ended.
 - After authentication, a consumed UUID returns `ALREADY_EXISTS` before payload, ObjectKey, Channel, ACL, or
   Publish seq-CAS validation. Duplicate handling does not compare any of those request fields; a UUID can consume
   at most one message.
-- The Python high-level client exposes one UUID at a time through `get_uuid()`; its pool behavior is described in
-  the usage guide. The generated gRPC stub exposes AllocateUuids as part of the protocol.
+- For Python usage, see the [usage guide](USAGE.md#publish-messages).
 - The allocation and lookup RPCs are defined in sections 3.2 and 3.3. The complete recovery procedure for an
   uncertain publish result is defined only in section 2.9.
 
@@ -138,15 +127,14 @@ fixed fields, list membership, and initialization message are defined in
 - `ObjectKey` contains `object_id + object_token` and is a permanent bearer
   capability. Anyone holding both values can read the object's metadata and data
   without a principal token or Channel permission.
-- Object capabilities can be transferred. They cannot currently be revoked,
-  rotated, deleted, or restricted after creation. Treat `object_token` as a secret.
+- Object capabilities can be transferred and remain valid permanently. Keep `object_token` secret.
 - Publish and PublishAutoSeq accept at most 1024 `object_keys`. The server does
   not deduplicate the list and stores it in request order.
 - Every reference must have a nonzero object ID and a nonempty token. Malformed
   references return `INVALID_ARGUMENT`; a missing object, uncommitted object, or
   token mismatch returns `NOT_FOUND`.
 - If any reference is invalid, the complete message is rejected and `max_seq`
-  does not advance. Reference validation does not read object data.
+  does not advance.
 - Fetch, Subscribe, and administrative ListMessages return complete ObjectKeys.
   Any caller allowed to read a message therefore receives every capability in it.
 
@@ -155,13 +143,14 @@ fixed fields, list membership, and initialization message are defined in
 - All mutations and non-streaming stateful business/administrative reads have one
   server-side global order. Writes commit in that order, while non-streaming reads
   acquire a consistent snapshot at their position. Subscribe is excluded.
-- Publish evaluates token validity and Channel write permission against the latest
+- Publish evaluates the `principal + token` pair and Channel write permission against the latest
   committed state preceding the message commit. No token or Channel mutation can
   intervene between those checks and the commit.
 - If RemoveMember commits first on a protected or private Channel, a later publish
   by that removed member returns `PERMISSION_DENIED`; public Channel writes are not
   controlled by membership. If DeleteToken commits first, a later publish using
-  that token returns `UNAUTHENTICATED`. A message committed first remains valid.
+  that deleted pair returns `UNAUTHENTICATED`; the same token string under another
+  principal is unaffected. A message committed first remains valid.
 - WriteObject may interleave with other operations while processing. Only a fully
   and durably committed object is visible to reads and message references; that
   complete commit is the write's ordering point.
@@ -178,49 +167,25 @@ fixed fields, list membership, and initialization message are defined in
 
 ### 2.9 Handling an Uncertain Publish Result
 
-When Publish or PublishAutoSeq does not return a successful response, the client
-cannot always conclude that the message was not committed. A broken connection,
-client cancellation, `DEADLINE_EXCEEDED`, and some `UNAVAILABLE` failures may
-occur after the server started or completed persistence. Retain the UUID supplied
-to that call. Retry the same Publish or PublishAutoSeq with that UUID. If the retry returns `ALREADY_EXISTS`, call
-`GetSeqByUuid` with the UUID to obtain the original committed seq; do not scan messages or UUIDs to reconcile this
-result. Retrying with a new UUID is a new publish attempt.
+For an uncertain publish result, retain the original UUID and retry Publish or
+PublishAutoSeq with it. If the retry returns `ALREADY_EXISTS`, use `GetSeqByUuid`
+to obtain the committed message's seq. A new UUID starts a new publish attempt.
 
-For an OpenEvent server conforming to this contract, classify the terminal
-publish status as follows. A non-commit guarantee means that this request did not
-create an `EventMessage` or advance `max_seq` on behalf of this request; it does
-not prove that an earlier attempt for the same application event was not
-committed, and does not mean that the cause is recoverable.
+The following table describes the result of this RPC from the server's response:
 
-| Status | Commit guarantee |
+| Status | Commit result |
 |--------|------------------|
 | `OK` | Synchronously persisted and committed |
-| `UNAUTHENTICATED` | Guaranteed not committed |
-| `PERMISSION_DENIED` | Guaranteed not committed |
-| `NOT_FOUND` | Guaranteed not committed |
-| `INVALID_ARGUMENT` | Guaranteed not committed |
-| `RESOURCE_EXHAUSTED` | Guaranteed not committed |
-| `ABORTED` | Guaranteed not committed; only for Publish seq-CAS conflicts and not expected from PublishAutoSeq |
-| `ALREADY_EXISTS` | Guaranteed not committed; the UUID was already used by an earlier committed message |
+| `UNAUTHENTICATED` | Not committed |
+| `PERMISSION_DENIED` | Not committed |
+| `NOT_FOUND` | Not committed |
+| `INVALID_ARGUMENT` | Not committed |
+| `RESOURCE_EXHAUSTED` | Not committed |
+| `ABORTED` | Not committed; Publish seq-CAS conflict |
+| `ALREADY_EXISTS` | Already committed by an earlier call using this UUID |
 | Any other non-`OK` status, or no gRPC status | Uncertain outcome |
 
-If the server observes cancellation or a deadline before committing, it does not
-commit this message. Once the commit has started, cancellation or a deadline
-cannot guarantee that persistence is prevented. A caller cannot distinguish
-these cases from a final `CANCELLED` or `DEADLINE_EXCEEDED` alone.
-
-Therefore `CANCELLED`, `DEADLINE_EXCEEDED`, `UNKNOWN`, `UNAVAILABLE`,
-`INTERNAL`, connection loss, and proxy resets must be treated as uncertain. Even
-if one `UNAVAILABLE` error appears to occur before connection establishment, a
-caller must not infer non-commit from error text. Only statuses explicitly marked
-"Guaranteed not committed" may enter direct cause-remediation and retry logic.
-A guaranteed non-commit caused by a permanent parameter, permission, or payload
-error still must not be retried blindly.
-
-The table applies only to terminal statuses produced by a conforming OpenEvent
-server. If a proxy, load balancer, or client can synthesize the same status after
-forwarding the request, and the deployment cannot prove that it happened before
-forwarding, treat the outcome as uncertain.
+Cancellation, timeout, and connection loss are handled as uncertain outcomes.
 
 ## 3. EventService
 
@@ -304,7 +269,7 @@ recovery rules are defined in sections 2.4 and 2.9. The response contains the co
 rpc Fetch(FetchRequest) returns (FetchResponse);
 ```
 
-- token must match principal.
+- The `principal + token` pair must be valid.
 - limit must be in `1..1000`.
 - Empty channels means no Channel filter. When non-empty, every listed Channel
   must exist and be readable by the caller; otherwise the whole request returns
@@ -319,10 +284,9 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 | `> max_seq` | Empty result with `next_seq=max_seq+1`, `last_seq=max_seq` |
 | `1..max_seq` | Scan visible messages from this seq |
 
-The response contains at most limit visible messages. Explicit channel permissions
-are validated before scanning, so one failed Channel never produces a partial
-response. A server may end a page
-early because of scan or response-size budgets, so a short page, or an empty page
+The response contains at most limit messages matching ACL, Channel, and recipient
+filters. A server may end a page early because of scan or response-size budgets,
+so a short page, or an empty page
 after scanning invisible messages, does not imply end of stream. A single
 returnable message may exceed the page's soft size budget but remains subject to
 the gRPC transport limit; the soft budget never causes an empty-page loop at the
@@ -330,9 +294,6 @@ same cursor. `next_seq` is the suggested continuation point and `last_seq` is th
 highest committed seq observed by this response. Continue while
 `next_seq <= last_seq`; a larger next_seq means the observed tail was reached.
 Filtering never moves next_seq backward.
-`from_seq=0` is an inclusive message position, not an empty-result sentinel. The
-system initialization message is subject to the same Channel, recipient, and
-other filters as every scanned message.
 
 ### 3.7 Subscribe
 
@@ -340,9 +301,9 @@ other filters as every scanned message.
 rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 ```
 
-Pushes messages visible to the caller in global seq order. The token must match
-the principal. Empty `channels`
-disables Channel filtering. When non-empty, every listed Channel must exist and
+Pushes messages visible to the caller in global seq order. The `principal + token`
+pair must be valid. Empty `channels` disables Channel filtering.
+When non-empty, every listed Channel must exist and
 be readable by the caller; otherwise the stream returns an error: `NOT_FOUND` for
 a missing Channel and `PERMISSION_DENIED` for an unreadable Channel. After
 validation, only readable messages from the listed Channel IDs are pushed.
@@ -350,15 +311,16 @@ Normal Channel ACL and `only_my_recipient` filtering still apply. Filtered
 records do not produce responses but are consumed by the server's scan. If an
 explicitly listed Channel becomes unreadable while the stream is running, a
 later batch returns `PERMISSION_DENIED` and ends the stream. Subscribe is outside
-the non-streaming read/write linearization
-order and has no linearization point relative to concurrent RPCs. Each batch
+the non-streaming read/write linearization order and has no linearization point
+relative to concurrent RPCs. Each batch
 uses a consistent read view covering commits completed before that batch began;
 those commits become visible by the next successful 100 ms view refresh.
 
 With no channels specified, a permission change makes later batches filter out
 private Channels that are no longer readable; it does not end the whole stream.
 Removing a member from a protected Channel does not change read permission.
-Deleting the token makes the next batch return `UNAUTHENTICATED` and end the stream.
+Deleting the subscription's `principal + token` pair makes the next batch return
+`UNAUTHENTICATED` and end the stream.
 
 | `from_seq` | Behavior |
 |------------|----------|
@@ -367,26 +329,19 @@ Deleting the token makes the next batch return `UNAUTHENTICATED` and end the str
 | `max_seq + 1` | Accept the subscription and wait for that sequence to be committed |
 | `> max_seq + 1` | `OUT_OF_RANGE` |
 
-`SubscribeResponse.message` carries normal messages, including the system
-initialization message when it passes the requested filters. Starting exactly one
-position beyond the current tail waits for the next message; starting farther
-ahead returns `OUT_OF_RANGE`. Subscription responses contain messages only and do
-not contain a cursor field. After disconnect, resume from the last processed
-`seq + 1`. Subscribe waits when that position is the current `max_seq + 1` and
-returns `OUT_OF_RANGE` only when it is farther ahead. A caller may also subscribe
-inclusively from the last processed seq and suppress the replay. When a
-subscription reaches its current tail it remains open and waits for later
-committed messages.
+`SubscribeResponse.message` contains a message. The subscription stays open at
+the tail and waits for new messages. After cancellation or disconnect, resume
+Subscribe or Fetch from the last processed `seq + 1`; alternatively, subscribe
+inclusively from the last processed seq and filter the replay.
 
 After authentication, explicit Channel validation, and starting-sequence
-validation succeed, the server sends gRPC initial response metadata before it waits for or pushes an OpenEvent
-message. This confirms that the subscription was accepted even when its starting
-seq or every current record is filtered out. The metadata is a gRPC control
-response, not a `SubscribeResponse` or an OpenEvent message.
+validation succeed, the server sends gRPC initial response metadata before it
+waits for or pushes an OpenEvent message. This metadata confirms acceptance
+even when all current messages are filtered out.
 
-The OpenEvent server has no fixed lifetime for a valid, established Subscribe
-stream. Its public gRPC endpoint sends an HTTP/2 PING after 30 seconds without
-transport activity and closes a connection whose PING acknowledgement does not
+A Subscribe stream stays open until interrupted. The public gRPC endpoint sends
+an HTTP/2 PING after 30 seconds without transport activity and closes a connection
+whose PING acknowledgement does not
 arrive within 10 seconds. It accepts client PINGs no more frequent than every 20
 seconds. The Python high-level client sends client PINGs every 30 seconds and
 does not set a deadline for Subscribe; a caller using another gRPC client or a
@@ -414,28 +369,16 @@ rpc WriteObject(WriteObjectRequest) returns (WriteObjectResponse);
 - `description` may be empty and must encode to at most 4096 UTF-8 bytes.
 - `data` must contain `1..4,194,304` bytes. The 4 MiB limit is fixed and is not
   affected by the message payload configuration.
-- The server stores these strings as opaque metadata and does not interpret the
-  object contents or derive a file path from metadata.
+- The server stores these strings as opaque metadata and stores object data as supplied.
 - Success returns a nonzero globally increasing `object_id` and an opaque
   `object_token`. IDs can contain gaps and are never reused. Objects are immutable.
-- The object token is a 32-byte CSPRNG value encoded as 43 unpadded Base64URL
-  characters. Callers must treat its representation as opaque.
 - Success is returned only after object data and metadata are durably committed.
-  A cancellation, deadline, connection loss, or some server error after processing
-  starts can leave the result uncertain. The server continues committing or
-  cleaning up after client cancellation.
-- The API has no idempotency key or query-by-creator operation. Callers that need
-  to avoid duplicate immutable objects must choose their own handling for an
-  uncertain result.
+  If the result is uncertain after interruption, retrying may create another object.
 
 Invalid metadata or data size returns `INVALID_ARGUMENT`. Invalid principal/token
 returns `UNAUTHENTICATED`. Object-file storage space, quota, or inode exhaustion
-returns `RESOURCE_EXHAUSTED`; RocksDB write failures and other storage availability
-failures return `UNAVAILABLE`. A RocksDB write failure still triggers server
-shutdown.
-Fatal storage failures follow section 2.1. A storage failure during commit may
-leave the object outcome uncertain and cause the server to exit. After restart,
-only committed objects are visible; partially written objects are never exposed.
+returns `RESOURCE_EXHAUSTED`; other storage availability failures return
+`UNAVAILABLE`. Fatal storage failures follow section 2.1.
 
 ### 4.2 GetObjectMetadata
 
@@ -444,7 +387,6 @@ rpc GetObjectMetadata(GetObjectMetadataRequest) returns (GetObjectMetadataRespon
 ```
 
 Returns the committed object's `name`, `type`, `description`, and total `nbytes`.
-Success does not mean that object data has passed an integrity check.
 
 ### 4.3 ReadObject
 
@@ -452,8 +394,7 @@ Success does not mean that object data has passed an integrity check.
 rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
 ```
 
-`nbytes` must be positive. The server checks the committed object's file type and
-total size, then reads only the requested range according to these rules:
+`nbytes` must be positive. The requested range follows these rules:
 
 | Condition | Result |
 |-----------|--------|
@@ -467,10 +408,10 @@ return only that remaining content.
 
 For GetObjectMetadata and ReadObject, `object_id=0` or an empty object token is
 `INVALID_ARGUMENT`. A missing/uncommitted object and every token mismatch return
-the same `NOT_FOUND` result. A nonempty token is otherwise treated as opaque and
-is not rejected based on syntax. ReadObject returns `DATA_LOSS` if committed data
-is missing, not a regular file, or has the wrong size, and the server exits as
-described in section 2.1. This API does not detect same-size external content changes.
+the same `NOT_FOUND` result. Tokens are treated as opaque strings.
+ReadObject returns `DATA_LOSS` if committed data is missing, not a regular file,
+or has the wrong size, and the server exits as
+described in section 2.1.
 
 ## 5. ChannelService
 
@@ -547,8 +488,10 @@ permission.
 ## 6. AdminService
 
 AdminService is defined in [`proto/admin.proto`](../proto/admin.proto), runs only
-on the admin endpoint, and carries no business principal/token. Deployments must
-protect it with network isolation or external authorization.
+on the admin endpoint, and requires no business credentials from its caller.
+The principal/token fields of AddToken and DeleteToken identify the managed
+credential, not the admin caller. Deployments must protect the endpoint with
+network isolation or external authorization.
 
 ```protobuf
 rpc AddToken(AddTokenRequest) returns (AddTokenResponse);
@@ -558,13 +501,17 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 
 ### 6.1 AddToken and DeleteToken
 
-- `AddToken.target_principal` must be greater than zero; otherwise it returns
-  `INVALID_ARGUMENT`. Each successful call
-  creates a new token binding; one principal may have multiple tokens. The RPC
-  has no idempotency key and does not deduplicate by principal.
-- `DeleteToken.target_token` must be non-empty; empty input returns
-  `INVALID_ARGUMENT`. Deleting a missing token is an idempotent success. Tokens are matched as opaque strings; wildcard or prefix
-  deletion is not supported.
+- A credential is identified by its `(principal, token)` pair. The same token string
+  may be independently valid under different principals.
+- `AddTokenRequest.principal` must be greater than zero; otherwise it returns
+  `INVALID_ARGUMENT`. Principals are assigned by the caller and do not need to be
+  created or registered first. Success activates the pair of this principal and
+  the returned nonempty token, provided in `AddTokenResponse.token`.
+  One principal may have multiple tokens.
+- `DeleteTokenRequest.principal` must be greater than zero, and `token` must be
+  non-empty; otherwise it returns `INVALID_ARGUMENT`. Deletion affects only that
+  exact pair and succeeds even when the pair is absent. Tokens are matched exactly
+  as opaque strings.
 
 ### 6.2 ListMessages
 
@@ -582,23 +529,12 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
   deferred by the budget is not skipped by next_seq.
 - next_seq is the suggested continuation point.
 - last_seq is the highest committed seq observed when the page starts.
-- A cursor beyond the tail returns an empty page and the tail's next position for
-  ListMessages. Subscribe waits when its starting sequence equals `max_seq + 1`
-  and returns `OUT_OF_RANGE` only when it is greater. `next_seq > last_seq` means the page has
-  reached its observed tail.
+- A cursor beyond the tail returns an empty page and the tail's next position.
+  `next_seq > last_seq` means the page has reached its observed tail.
 - Concurrent appends may increase last_seq on later pages.
 
 ## 7. Compatibility Guidance
 
-- Both proto files together form the public protocol contract.
-- The reserved system Channel and its `system.v1` payload are defined in
-  [`SYSTEM_PROTOCOL.md`](SYSTEM_PROTOCOL.md).
-- Branch on gRPC status codes, not error text.
-- Consumers should record the last processed seq. Subscribe reconnection follows
-  the recovery rule in section 3.7.
-- Business principals are positive integers; `principal=0` is reserved for
-  server-generated system behavior.
-- ObjectKey values are credentials. Preserve repeated-field order, do not log
-  tokens, and do not assume an object capability remains private after attaching
-  it to a readable message.
+- Version 0.10.0 is incompatible with older protocols and data directories.
+  Update the server and SDK together and use a new data directory.
 - Put payload schema rules in the business protocol named by Channel protocol.

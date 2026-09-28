@@ -39,7 +39,7 @@ required = {
     "grpc": "grpcio",
     "packaging": "packaging",
     "pytest": "pytest",
-    "openevent.sdk": "openevent-sdk>=0.8.0",
+    "openevent.sdk": "openevent-sdk>=0.10.0",
 }
 missing = []
 for module, requirement in required.items():
@@ -55,7 +55,7 @@ if missing:
 try:
     version = importlib.metadata.version("openevent-sdk")
 except importlib.metadata.PackageNotFoundError:
-    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.8.0", file=sys.stderr)
+    print("missing e2e Python dependency in the current environment: openevent-sdk>=0.10.0", file=sys.stderr)
     sys.exit(2)
 from packaging.version import InvalidVersion, Version
 
@@ -64,12 +64,31 @@ try:
 except InvalidVersion:
     print(f"installed openevent-sdk has an invalid version: {version}", file=sys.stderr)
     sys.exit(2)
-if installed_version < Version("0.8.0"):
-    print(f"openevent-sdk>=0.8.0 is required for e2e tests, found {version}", file=sys.stderr)
+if installed_version < Version("0.10.0"):
+    print(f"openevent-sdk>=0.10.0 is required for e2e tests, found {version}", file=sys.stderr)
     sys.exit(2)
 
 from openevent.sdk import AdminClient, OpenEventClient
 from openevent.sdk.proto import admin_pb2, openevent_pb2
+from google.protobuf.descriptor import FieldDescriptor
+
+for message, requirements in (
+    (admin_pb2.AddTokenRequest, (("principal", 1, FieldDescriptor.TYPE_UINT64),)),
+    (admin_pb2.DeleteTokenRequest, (
+        ("principal", 1, FieldDescriptor.TYPE_UINT64),
+        ("token", 2, FieldDescriptor.TYPE_STRING),
+    )),
+):
+    for name, number, field_type in requirements:
+        field = message.DESCRIPTOR.fields_by_name.get(name)
+        if field is None or field.number != number or field.type != field_type:
+            print(f"installed openevent-sdk does not provide {message.__name__}.{name}={number}", file=sys.stderr)
+            sys.exit(2)
+
+token_field = admin_pb2.AddTokenResponse.DESCRIPTOR.fields_by_name.get("token")
+if token_field is None or token_field.number != 1 or token_field.type != token_field.TYPE_STRING:
+    print("installed openevent-sdk does not provide AddTokenResponse.token=1", file=sys.stderr)
+    sys.exit(2)
 
 service = admin_pb2.DESCRIPTOR.services_by_name.get("AdminService")
 if service is None or "ListMessages" not in service.methods_by_name or not hasattr(AdminClient, "list_messages"):

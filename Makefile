@@ -7,7 +7,7 @@ INSTALL_ARGS ?=
 help:
 	@printf 'Usage: make <target>\n\n'
 	@printf 'Targets:\n'
-	@printf '  init     Generate local Python protobuf modules for development\n'
+	@printf '  init     Assemble the development package and protobuf modules under build/python/\n'
 	@printf '  build    Build artifacts without installing into the current Python environment\n'
 	@printf '  install  Build and install the generated wheel with pip\n'
 	@printf '  test     Run tests or SDK smoke checks under build/\n'
@@ -20,7 +20,7 @@ help:
 	@printf '  make install PYTHON=/opt/openevent-sdk/bin/python\n'
 
 init:
-	./generate_python_proto.sh
+	PYTHON="$(PYTHON)" ./generate_python_proto.sh
 
 build:
 	PYTHON="$(PYTHON)" ./build.sh
@@ -36,5 +36,6 @@ e2e:
 
 clean:
 	rm -rf build dist
+	# Also remove generated modules left by the old source-tree build layout.
 	rm -f src/openevent/sdk/proto/openevent_pb2.py src/openevent/sdk/proto/openevent_pb2_grpc.py
 	rm -f src/openevent/sdk/proto/admin_pb2.py src/openevent/sdk/proto/admin_pb2_grpc.py

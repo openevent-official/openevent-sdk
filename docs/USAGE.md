@@ -17,13 +17,6 @@ make install
 See [Build and Test in the README](../README.md#build-and-test) for Python environment selection
 and installation arguments.
 
-For local development, generate protobuf code and use the source tree directly:
-
-```bash
-make init
-export PYTHONPATH="$PWD/src"
-```
-
 ## Connect to the Service
 
 ```python
@@ -36,31 +29,20 @@ token = "user-token"
 ```
 
 `target` is the gRPC service address. `OpenEventClient` and `AdminClient` create
-`grpc.insecure_channel` instances with fixed transport options and do not accept
-a caller-provided channel. Use the generated gRPC stubs directly when TLS or
-other custom gRPC connection options are required.
+and manage plaintext gRPC connections with a 64 MiB limit per sent or received
+message. Use the generated gRPC stubs for TLS or custom connection options.
 
-`OpenEventClient` and `AdminClient` accept a constructor `timeout_ms` with a
-30000-millisecond (30-second) default. It must be a finite number greater than
-zero; `None`, boolean, zero, negative, NaN, and infinite values raise `ValueError`,
-both at construction and on reassignment. The SDK converts this value to seconds
-for every non-streaming gRPC call. `OpenEventClient.subscribe` deliberately has no RPC
-deadline: an idle, healthy subscription remains open until the caller cancels it,
-the server ends it, or the gRPC transport fails.
+Both clients accept `timeout_ms`, defaulting to 30000 milliseconds (30 seconds),
+for non-streaming RPCs. Construction and reassignment require a finite number
+greater than zero, excluding booleans; invalid values raise `ValueError`.
+Subscriptions continue until cancelled, ended by the server, or disconnected.
 
-The channel created by `OpenEventClient` uses the documented transport
-keepalive policy for Subscribe. This is a transport liveness check, not an
-OpenEvent message, so it never appears in a subscription. A broken connection
-therefore finishes the subscription (and invokes a done callback, if registered)
-without waiting for a per-RPC deadline. The authoritative PING intervals and
-compatibility requirements are in the [Subscribe API contract](API.md#37-subscribe).
+The SDK enables gRPC keepalive for subscriptions. A connection failure ends the
+stream and invokes registered completion callbacks; see the
+[Subscribe API](API.md#37-subscribe).
 
-Call `client.close()` when the client is no longer needed, or use it as a
-context manager. `close()` is idempotent and closes the gRPC channel created by
-the client, cancelling pending RPCs and discarding unused UUIDs. Closing the
-connection does not wait for a UUID allocation request to finish first. The
-destructor is only a fallback for an omitted explicit close because Python does
-not guarantee when it runs.
+Call `client.close()` after use, or use a context manager. `close()` is idempotent:
+it closes the connection and cancels pending RPCs.
 
 ```python
 with OpenEventClient("127.0.0.1:9527") as scoped_client:
@@ -94,25 +76,13 @@ created = client.create_channel(
 channel_id = created.channel.channel_id
 ```
 
-Visibility:
-
-- `VISIBILITY_PUBLIC`: all authenticated users can read and write.
-- `VISIBILITY_PROTECTED`: all authenticated users can read; members can write.
-- `VISIBILITY_PRIVATE`: members can read and write.
-
-The reserved system Channel has `channel_id=0`, name `system`, and protocol
-`system.v1`. It is server-owned and read-only. Every initialized server contains
-its permanent initialization message at `seq=0`; the payload schema is defined
-by [the system protocol](SYSTEM_PROTOCOL.md). Business principals must be greater
-than zero.
+See [Channel ACL](API.md#25-channel-acl) for `visibility` and member permissions,
+and [the system protocol](SYSTEM_PROTOCOL.md) for the reserved system Channel.
 
 ## Publish Messages
 
-Call `get_uuid()` before each logical publish. Each client has its own in-memory
-pool. When empty, it calls `AllocateUuids(count=1024)` once and hands out UUIDs in
-response order. The pool is neither persisted nor shared across clients; closing
-the client or exiting the process discards unused entries. Pass the UUID
-explicitly when publishing; the SDK does not fill it in or retry automatically.
+Call `get_uuid()` before each logical publish and pass the UUID explicitly when
+publishing. The caller handles retries.
 
 The simplest publish lets the server assign the global `seq`:
 
@@ -149,29 +119,9 @@ client.publish(
 )
 ```
 
-`payload` is an opaque byte array. You can encode it as JSON, MessagePack,
-custom binary, or plain text.
-
-For an uncertain Publish result, retain the UUID and follow the recovery procedure in API contract section 2.9. The
-final duplicate-UUID step obtains the committed sequence without fetching history:
-
-```python
-import grpc
-
-try:
-    client.publish_auto_seq(principal, token, channel_id, payload, uuid=uuid)
-except grpc.RpcError as exc:
-    if exc.code() != grpc.StatusCode.ALREADY_EXISTS:
-        raise
-    committed_seq = client.get_seq_by_uuid(uuid)
-```
-
-`get_seq_by_uuid()` returns the sequence for a UUID consumed by a committed message. Its protocol behavior is defined
-in API contract section 3.3.
-
-SDK-created gRPC channels use fixed per-message send and receive limits of
-64 MiB. The transport limit needed to read historical messages does not decrease
-with the current payload write limit. See the [Payload API](API.md#23-payload).
+`payload` uses bytes. If a publish result is uncertain, retain the original UUID and follow the
+[recovery procedure](API.md#29-handling-an-uncertain-publish-result).
+Use `client.get_seq_by_uuid(uuid)` to look up the committed message position.
 
 ## Write and Reference Objects
 
@@ -204,8 +154,7 @@ published = client.publish_auto_seq(
 )
 ```
 
-Read metadata and a byte range with the ObjectKey. Object reads do not carry a
-principal token because the ObjectKey itself is the authorization:
+Use the ObjectKey to authorize metadata and byte-range reads:
 
 ```python
 metadata = client.get_object_metadata(
@@ -220,11 +169,9 @@ chunk = client.read_object(
 )
 ```
 
-Objects are immutable, nonempty, and limited to 4 MiB. ObjectKeys are permanent,
-transferable bearer credentials; attaching one to a message discloses it to every
-caller that can read that message, including administrative readers. Do not log
-object tokens. See sections 2.7 and 4 of [API.md](API.md) for exact limits, range
-behavior, errors, and uncertain WriteObject results.
+Object limits, reference authorization, and errors are defined by the
+[object API](API.md#4-objectstorageservice)
+and [ObjectKey rules](API.md#27-object-capabilities-and-message-references).
 
 ## Fetch Messages
 
@@ -246,22 +193,9 @@ last_seq = response.last_seq
 
 The example reads only the selected application Channel and filters out the
 system Channel. Use the response's `next_seq` as the next `from_seq` to continue;
-`next_seq > last_seq` means the tail observed by this page was reached. A short or
-empty page need not be the end. Full filtering, pagination, and error rules are in
+use `next_seq > last_seq` to determine whether the tail observed by this page was
+reached. Full filtering, pagination, and error rules are in
 the [Fetch API](API.md#36-fetch).
-
-To fetch only messages targeted to the current principal:
-
-```python
-response = client.fetch(
-    principal=principal,
-    token=token,
-    from_seq=1,
-    limit=100,
-    channels=[channel_id],
-    only_my_recipient=True,
-)
-```
 
 ## Subscribe to Messages
 
@@ -279,25 +213,21 @@ for item in client.subscribe(
     print(message.seq, message.payload)
 ```
 
-`wait_started(timeout_ms)` waits for the server's initial response metadata. It is
-useful when a caller must distinguish a subscription accepted by the server from
-one that is still trying to connect. `timeout_ms` must be a finite number of
-milliseconds greater than zero. On timeout, it cancels this stream and raises
-`TimeoutError`.
-An RPC error before acceptance is propagated unchanged. A successful return does
-not impose a deadline on the established stream and does not wait for an
-OpenEvent message.
+`wait_started(timeout_ms)` waits for the server to accept the subscription and
+returns `None` on success. Its argument follows the client's `timeout_ms`
+validation and applies only to this establishment wait. A timeout cancels the
+stream and raises `TimeoutError`; RPC errors before acceptance propagate unchanged.
 
-The example scans the selected application Channel from seq 0 and waits for new
-messages at the tail. Starting-sequence boundaries, termination or filtering
-after permission changes, and recovery after server shutdown are defined in the
-[Subscribe API](API.md#37-subscribe).
+Subscriptions wait for new messages at the tail. Starting positions, permission
+changes, and reconnection are defined in the [Subscribe API](API.md#37-subscribe).
 
-The high-level `OpenEventClient.subscribe` iterator suppresses repeated or
-backward message `seq` values within one stream. The SDK does not reconnect
-automatically, and its duplicate watermark does not span connections. Save the
-last processed seq and handle replays according to the API resume rules. Use the
-generated gRPC stub when the raw stream is required.
+The high-level `OpenEventClient.subscribe` iterator requires strictly increasing
+message `seq` values within one stream. The first seq may be 0, and gaps caused by
+filtering are valid. A repeated or backward seq violates the stream protocol:
+the SDK cancels that stream and raises `RuntimeError` with the previous and
+received sequence values.
+Each subscription checks its sequence independently. Save the last processed seq
+and resubscribe according to the API resume rules.
 
 ## Targeted Messages
 
@@ -328,10 +258,9 @@ from openevent.sdk import AdminClient
 
 admin = AdminClient("127.0.0.1:9528")
 
-binding = admin.add_token(target_principal=1001).binding
-print("created token for principal:", binding.principal)
+token = admin.add_token(principal=1001).token
 
-admin.delete_token(binding.token)
+admin.delete_token(principal=1001, token=token)
 
 message_page = admin.list_messages(from_seq=0, limit=100)
 for message in message_page.messages:
@@ -339,8 +268,9 @@ for message in message_page.messages:
 
 ```
 
-The example creates and deletes a token, then reads one administrative message
-page. Continue message pages with `next_seq`. Query contracts are defined in
+The example obtains a token for principal 1001, deletes that `(principal, token)`
+pair, and reads one administrative message page. Continue message pages with
+`next_seq`. Credential pairs, parameters, and deletion are defined in
 the [AdminService API](API.md#6-adminservice).
 Protect the admin endpoint when deploying.
 

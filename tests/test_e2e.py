@@ -85,7 +85,7 @@ def client(server) -> Iterator[OpenEventClient]:
 
 
 def _token(admin: AdminClient, principal: int) -> str:
-    return admin.add_token(target_principal=principal).binding.token
+    return admin.add_token(principal=principal).token
 
 
 def _unique(prefix: str) -> str:
@@ -665,6 +665,20 @@ def test_subscribe_channel_filter(admin: AdminClient, client: OpenEventClient) -
         payload=b"subscribe selected channel",
         uuid=_uuid(client),
     ).seq
+    client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=first_channel_id,
+        payload=b"subscribe filtered gap",
+        uuid=_uuid(client),
+    )
+    later_seq = client.publish_auto_seq(
+        principal=principal,
+        token=token,
+        channel_id=selected_channel_id,
+        payload=b"subscribe after gap",
+        uuid=_uuid(client),
+    ).seq
 
     stream = client.subscribe(
         principal=principal,
@@ -674,11 +688,27 @@ def test_subscribe_channel_filter(admin: AdminClient, client: OpenEventClient) -
     )
     try:
         response = next(stream)
+        later = next(stream)
     finally:
         stream.cancel()
     assert response.message.seq == selected_seq
     assert response.message.channel_id == selected_channel_id
     assert response.message.payload == b"subscribe selected channel"
+    assert later.message.seq == later_seq
+    assert later_seq > selected_seq + 1
+    assert later.message.channel_id == selected_channel_id
+    assert later.message.payload == b"subscribe after gap"
+
+    replay = client.subscribe(
+        principal=principal,
+        token=token,
+        from_seq=selected_seq,
+        channels=[selected_channel_id],
+    )
+    try:
+        assert next(replay).message.seq == selected_seq
+    finally:
+        replay.cancel()
 
     missing_stream = client.subscribe(
         principal=principal,
@@ -770,13 +800,30 @@ def test_subscribe_keepalive_closes_a_silently_dropped_transport(admin: AdminCli
 def test_token_delete_changes_authentication(admin: AdminClient, client: OpenEventClient) -> None:
     principal = 1501
     token = _token(admin, principal)
+    other_token = _token(admin, principal)
+    assert token and other_token
     client.get_status(principal=principal, token=token)
+    client.get_status(principal=principal, token=other_token)
 
-    admin.delete_token(target_token=token)
+    with pytest.raises(grpc.RpcError) as exc_info:
+        client.get_status(principal=principal + 1, token=token)
+    _assert_rpc_code(exc_info, grpc.StatusCode.UNAUTHENTICATED)
+
+    # Deleting an absent pair under another principal must leave this pair valid.
+    admin.delete_token(principal=principal + 1, token=token)
+    client.get_status(principal=principal, token=token)
+    admin.delete_token(principal=principal, token=token)
+    admin.delete_token(principal=principal, token=token)
 
     with pytest.raises(grpc.RpcError) as exc_info:
         client.get_status(principal=principal, token=token)
     _assert_rpc_code(exc_info, grpc.StatusCode.UNAUTHENTICATED)
+    if other_token == token:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            client.get_status(principal=principal, token=other_token)
+        _assert_rpc_code(exc_info, grpc.StatusCode.UNAUTHENTICATED)
+    else:
+        client.get_status(principal=principal, token=other_token)
 
 
 def test_admin_lists_all_messages_and_ports_are_isolated(
@@ -1204,7 +1251,8 @@ def test_reserved_principals_and_system_mutations(admin, client):
     token = _token(admin, 2002)
     channel = client.create_channel(2002, token, _unique("reserved")).channel.channel_id
     invalid = [
-        lambda: admin.add_token(0), lambda: admin.delete_token(""),
+        lambda: admin.add_token(0), lambda: admin.delete_token(2002, ""),
+        lambda: admin.delete_token(0, token), lambda: admin.delete_token(0, ""),
         lambda: client.get_status(0, token), lambda: client.fetch(0, token, 0, 1),
         lambda: client.get_channel(0, token, 0), lambda: client.list_channels(0, token),
         lambda: client.create_channel(0, token, "zero"),
@@ -1230,8 +1278,8 @@ def test_reserved_principals_and_system_mutations(admin, client):
             call()
         assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
     assert client.get_status(2002, token).max_seq == 0
-    admin.delete_token("absent-token")
-    admin.delete_token("absent-token")
+    admin.delete_token(2002, "absent-token")
+    admin.delete_token(2002, "absent-token")
 
 
 @pytest.mark.parametrize("visibility", [0, 1, 2])
@@ -1286,7 +1334,7 @@ def test_subscription_observes_member_removal_and_token_deletion(admin, client, 
         private_seq = client.publish_auto_seq(owner, owner_token, private, b"after-private", client.get_uuid()).seq
         public_seq = client.publish_auto_seq(owner, owner_token, public, b"after-public", client.get_uuid()).seq
         assert next(stream).message.seq == (private_seq if visibility == 1 else public_seq)
-        admin.delete_token(member_token)
+        admin.delete_token(member, member_token)
         with pytest.raises(grpc.RpcError) as error:
             next(stream)
         assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
@@ -1411,7 +1459,7 @@ def test_wait_started_distinguishes_acceptance_from_rejection(admin, client):
         stream.initial_metadata()
         ended = Event()
         stream.add_done_callback(lambda _: ended.set())
-        admin.delete_token(token)
+        admin.delete_token(2701, token)
         assert ended.wait(5)
         assert stream.wait_started(5_000) is None
         with pytest.raises(grpc.RpcError) as error:

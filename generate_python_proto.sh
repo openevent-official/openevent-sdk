@@ -2,7 +2,22 @@
 set -euo pipefail
 
 ROOT_DIR="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-OUT_DIR="$ROOT_DIR/src/openevent/sdk/proto"
+PYTHON_BIN="${PYTHON:-python3}"
+PACKAGE_DIR="$ROOT_DIR/build/python"
+OUT_DIR="$PACKAGE_DIR/openevent/sdk/proto"
+
+"$PYTHON_BIN" -B - "$ROOT_DIR" "$PACKAGE_DIR" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+root, package = map(Path, sys.argv[1:])
+if package.exists():
+    shutil.rmtree(package)
+shutil.copytree(root / 'src', package, ignore=shutil.ignore_patterns(
+    '__pycache__', '*.pyc', '*_pb2.py', '*_pb2_grpc.py',
+))
+PY
 
 mkdir -p "$OUT_DIR"
 touch "$OUT_DIR/__init__.py"

@@ -6,78 +6,23 @@
 contract documentation, the public `system.v1` initialization-message protocol,
 and Python SDK.
 
-The Python SDK is a lightweight wrapper around generated gRPC stubs. It does not
-add application-level business semantics. Its high-level subscription iterator
-suppresses repeated or backward message `seq` values within one stream. The
-high-level client exposes event, immutable object storage, and Channel RPCs, including individual UUID retrieval from
-an internal pool for deduplicated publishing and committed-sequence lookup by UUID;
-generated stubs remain available when raw gRPC access is required.
-
-## Directory Layout
-
-```text
-openevent-sdk/
-├── proto/
-│   ├── admin.proto
-│   └── openevent.proto
-├── docs/
-│   ├── API.md
-│   ├── SYSTEM_PROTOCOL.md
-│   └── USAGE.md
-├── Makefile
-├── build.sh
-├── generate_python_proto.sh
-├── scripts/
-│   └── install.py
-├── test.sh
-├── src/
-│   └── openevent/
-│       └── sdk/
-│           ├── __init__.py
-│           ├── admin_client.py
-│           ├── client.py
-│           └── proto/
-│               └── __init__.py
-└── pyproject.toml
-```
-
-`src/openevent/sdk/proto/*_pb2*.py` is generated from `proto/openevent.proto`
-and `proto/admin.proto` and is not tracked by Git. Generate it before local
-debugging, builds, or tests.
+The Python SDK provides lightweight clients for messages, objects, Channels, and
+administration. Generated gRPC stubs are also available for direct use.
+See the [usage guide](docs/USAGE.md) for examples.
 
 ## Build and Test
 
-Build, test, and install tasks are wrapped by `make`. The `build/` directory is
-reserved for temporary build dependencies, test dependencies, caches, and
-temporary files. Wheel artifacts are written to `dist/`.
+Build, test, and install tasks are wrapped by `make`. Python, `protoc`, and
+`grpc_python_plugin` are required; the latter two commands must be on `PATH`.
 
-Generate Python protobuf modules for local debugging:
-
-```bash
-make init
-```
-
-Build only, without installing into the current Python environment:
-
-```bash
-make build
-```
-
-The wheel is written to:
-
-```text
-dist/openevent_sdk-0.8.1-py3-none-any.whl
-```
-
-Build and install the generated wheel:
+Build and install the SDK:
 
 ```bash
 make install
 ```
 
-Installation uses only the wheel from the successful build. It checks the wheel's
-declared dependencies, reuses compatible installed dependencies, and then replaces
-only the SDK itself, even when its version is unchanged.
+Installation replaces the SDK even when its version is unchanged, while reusing
+installed runtime dependencies that satisfy its requirements.
 
 Choose an existing virtual environment with `PYTHON`:
 
@@ -85,14 +30,15 @@ Choose an existing virtual environment with `PYTHON`:
 make install PYTHON=/opt/openevent-sdk/bin/python
 ```
 
-`INSTALL_ARGS` accepts ordinary `pip install` options, such as `--no-index` and
-`--find-links`. Changing the destination with `--target`/`-t`, `--prefix`, `--root`,
-or `PIP_TARGET`, `PIP_PREFIX`, `PIP_ROOT` is not supported; use `PYTHON` instead.
+Select the installation environment with `PYTHON`. Use `INSTALL_ARGS` for pip
+options such as `--no-index` and `--find-links`.
 
-Run SDK unit tests, generating the protocol and installing the package in a test-only directory:
+Other common commands:
 
 ```bash
-make test
+make build  # Build only; write the wheel to dist/
+make test   # Run SDK unit tests
+make clean  # Remove build products and temporary files
 ```
 
 Run end-to-end tests against a real OpenEvent server:
@@ -101,18 +47,20 @@ Run end-to-end tests against a real OpenEvent server:
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-End-to-end tests use the `openevent-sdk>=0.8.0` package already installed in
-the current Python environment. They do not install this repository into a
-temporary dependency directory or generate SDK protobuf files. The current Python
-environment also needs `pytest` and `packaging`. Each case uses independent data
-and temporary ports, starts and stops its server, and keeps logs under
-`build/e2e/cases/`. Pass pytest options with `TEST_ARGS` and select Python with `PYTHON`.
+End-to-end tests require `openevent-sdk>=0.10.0`, `pytest`, and `packaging` to be
+installed in the current Python environment, plus an executable server binary.
+Logs are kept under `build/e2e/cases/`. Pass pytest options with `TEST_ARGS` and
+select Python with `PYTHON`.
 
-Clean build products and temporary files:
+Prepare an importable package for local development:
 
 ```bash
-make clean
+make init
+PYTHONPATH="$PWD/build/python" python3 -B -c 'from openevent.sdk import OpenEventClient'
 ```
+
+Rerun `make init` after editing `src/` or the proto files; `make build` and
+`make test` refresh it automatically.
 
 ## Documentation
 
@@ -121,10 +69,3 @@ make clean
 - [Usage guide](docs/USAGE.md)
 - [API contract](docs/API.md)
 - [System protocol](docs/SYSTEM_PROTOCOL.md)
-- [Business client](src/openevent/sdk/client.py)
-- [Admin client](src/openevent/sdk/admin_client.py)
-
-`docs/API.md` only documents public fields, RPC behavior, error semantics, and
-compatibility guidance. It does not describe server implementation details.
-`docs/SYSTEM_PROTOCOL.md` is the authoritative public schema for the permanent
-seq-0 initialization message in the reserved system Channel.

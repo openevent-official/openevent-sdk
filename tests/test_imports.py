@@ -280,47 +280,36 @@ def test_client_destructor_tolerates_partial_initialization(client_type) -> None
     client.__del__()
 
 
-def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
-    class Stream:
-        def __init__(self, responses):
-            self._responses = iter(responses)
-            self.cancelled = False
+class _TestSubscribeStream:
+    def __init__(self, sequences):
+        self._responses = iter(
+            openevent_pb2.SubscribeResponse(message=openevent_pb2.EventMessage(seq=seq))
+            for seq in sequences
+        )
+        self.cancelled = False
+        self.read_count = 0
 
-        def __iter__(self):
-            return self
+    def __iter__(self):
+        return self
 
-        def __next__(self):
-            return next(self._responses)
+    def __next__(self):
+        self.read_count += 1
+        return next(self._responses)
 
-        def cancel(self):
-            self.cancelled = True
-            return True
+    def cancel(self):
+        self.cancelled = True
+        return True
 
+
+def test_subscribe_preserves_increasing_sequences_and_forwards_cancellation() -> None:
     class Stub:
         def Subscribe(self, request, timeout=None):
             assert request.principal == 7
             assert request.token == "token"
-            assert request.from_seq == 2
+            assert request.from_seq == 0
             assert list(request.channels) == [11, 12]
             assert timeout is None
-            self.stream = Stream(
-                [
-                    openevent_pb2.SubscribeResponse(message=openevent_pb2.EventMessage(seq=0)),
-                    openevent_pb2.SubscribeResponse(message=openevent_pb2.EventMessage(seq=0)),
-                    openevent_pb2.SubscribeResponse(
-                        message=openevent_pb2.EventMessage(seq=2, payload=b"first")
-                    ),
-                    openevent_pb2.SubscribeResponse(
-                        message=openevent_pb2.EventMessage(seq=2, payload=b"duplicate")
-                    ),
-                    openevent_pb2.SubscribeResponse(
-                        message=openevent_pb2.EventMessage(seq=1, payload=b"backward")
-                    ),
-                    openevent_pb2.SubscribeResponse(
-                        message=openevent_pb2.EventMessage(seq=4, payload=b"second")
-                    ),
-                ]
-            )
+            self.stream = _TestSubscribeStream([0, 2, 4])
             return self.stream
 
     client = OpenEventClient.__new__(OpenEventClient)
@@ -328,13 +317,28 @@ def test_subscribe_filters_duplicate_and_backward_sequences() -> None:
     client.event_stub = stub
     client.timeout_ms = 2_500
     responses = list(
-        client.subscribe(principal=7, token="token", from_seq=2, channels=[11, 12])
+        client.subscribe(principal=7, token="token", from_seq=0, channels=[11, 12])
     )
 
-    assert [response.message.seq for response in responses if response.HasField("message")] == [0, 2, 4]
-    stream = client.subscribe(principal=7, token="token", from_seq=2, channels=[11, 12])
+    assert [response.message.seq for response in responses] == [0, 2, 4]
+    assert not stub.stream.cancelled
+    stream = client.subscribe(principal=7, token="token", from_seq=0, channels=[11, 12])
+    assert next(stream).message.seq == 0
     assert stream.cancel()
     assert stub.stream.cancelled
+
+
+@pytest.mark.parametrize("previous, received", [(0, 0), (2, 2), (2, 1)])
+def test_subscribe_rejects_duplicate_and_backward_sequences(previous, received) -> None:
+    underlying = _TestSubscribeStream([previous, received, previous + 1])
+    stream = client_module._SubscribeStream(underlying)
+
+    assert next(stream).message.seq == previous
+    with pytest.raises(RuntimeError, match=f"previous={previous}, received={received}"):
+        next(stream)
+
+    assert underlying.cancelled
+    assert underlying.read_count == 2
 
 
 def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
@@ -342,7 +346,7 @@ def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
         def initial_metadata(self):
             return ()
 
-    ready = client_module._DeduplicatingSubscribeStream(ReadyStream())
+    ready = client_module._SubscribeStream(ReadyStream())
     assert ready.wait_started(1_000) is None
 
     release = Event()
@@ -361,7 +365,7 @@ def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
             return True
 
     pending_stream = PendingStream()
-    pending = client_module._DeduplicatingSubscribeStream(pending_stream)
+    pending = client_module._SubscribeStream(pending_stream)
     with pytest.raises(TimeoutError, match="initial metadata"):
         pending.wait_started(10)
     assert pending_stream.cancelled
@@ -374,7 +378,7 @@ def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
         def initial_metadata(self):
             raise RuntimeError("subscription rejected")
 
-    failed = client_module._DeduplicatingSubscribeStream(FailedStream())
+    failed = client_module._SubscribeStream(FailedStream())
     with pytest.raises(RuntimeError, match="subscription rejected"):
         failed.wait_started(1_000)
 
@@ -385,6 +389,28 @@ def test_proto_service_boundaries_and_admin_field_numbers() -> None:
     admin_service = admin_pb2.DESCRIPTOR.services_by_name["AdminService"]
     assert [dependency.name for dependency in openevent_pb2.DESCRIPTOR.dependencies] == []
     assert [dependency.name for dependency in admin_pb2.DESCRIPTOR.dependencies] == ["openevent.proto"]
+
+    add_token = admin_service.methods_by_name["AddToken"]
+    assert add_token.input_type.full_name == "openevent.AddTokenRequest"
+    assert add_token.output_type.full_name == "openevent.AddTokenResponse"
+    add_token_request = admin_pb2.AddTokenRequest.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in add_token_request.items()} == {"principal": 1}
+    assert add_token_request["principal"].type == add_token_request["principal"].TYPE_UINT64
+    add_token_response = admin_pb2.AddTokenResponse.DESCRIPTOR.fields_by_name
+    assert list(add_token_response) == ["token"]
+    assert add_token_response["token"].number == 1
+    assert add_token_response["token"].type == add_token_response["token"].TYPE_STRING
+    assert "TokenBinding" not in admin_pb2.DESCRIPTOR.message_types_by_name
+
+    delete_token = admin_service.methods_by_name["DeleteToken"]
+    assert delete_token.input_type.full_name == "openevent.DeleteTokenRequest"
+    assert delete_token.output_type.full_name == "openevent.DeleteTokenResponse"
+    delete_token_request = admin_pb2.DeleteTokenRequest.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in delete_token_request.items()} == {
+        "principal": 1, "token": 2,
+    }
+    assert delete_token_request["principal"].type == delete_token_request["principal"].TYPE_UINT64
+    assert delete_token_request["token"].type == delete_token_request["token"].TYPE_STRING
 
     list_messages = admin_service.methods_by_name["ListMessages"]
     assert list_messages.input_type.full_name == "openevent.ListMessagesRequest"
@@ -574,7 +600,9 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
     (OpenEventClient, "add_member", "channel_stub", "AddMember", (7, "token", 3, 9), {}, openevent_pb2.AddMemberResponse),
     (OpenEventClient, "remove_member", "channel_stub", "RemoveMember", (7, "token", 3, 9), {}, openevent_pb2.RemoveMemberResponse),
     (AdminClient, "add_token", "stub", "AddToken", (7,), {}, admin_pb2.AddTokenResponse),
-    (AdminClient, "delete_token", "stub", "DeleteToken", ("exact-token",), {}, admin_pb2.DeleteTokenResponse),
+    (AdminClient, "add_token", "stub", "AddToken", (), {"principal": 7}, admin_pb2.AddTokenResponse),
+    (AdminClient, "delete_token", "stub", "DeleteToken", (7, "exact-token"), {}, admin_pb2.DeleteTokenResponse),
+    (AdminClient, "delete_token", "stub", "DeleteToken", (), {"principal": 7, "token": "exact-token"}, admin_pb2.DeleteTokenResponse),
 ])
 def test_remaining_wrappers_forward_and_preserve_responses(client_type, method, stub_name, rpc, args, kwargs, response_type):
     import inspect

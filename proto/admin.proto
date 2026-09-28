@@ -18,21 +18,17 @@ service AdminService {
     rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 }
 
-message TokenBinding {
-    string token = 1;
-    uint64 principal = 2;
-}
-
 message AddTokenRequest {
-    uint64 target_principal = 1;
+    uint64 principal = 1;        // Principal whose credential is created; must be nonzero
 }
 
 message AddTokenResponse {
-    TokenBinding binding = 1;
+    string token = 1;
 }
 
 message DeleteTokenRequest {
-    string target_token = 1;
+    uint64 principal = 1;        // Delete only this principal/token pair; must be nonzero
+    string token = 2;            // Exact nonempty token string
 }
 
 message DeleteTokenResponse {}

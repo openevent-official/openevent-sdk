@@ -15,13 +15,6 @@ make install
 
 选择 Python 环境和安装参数的方法见 [README 的构建和测试说明](../README_cn.md#构建和测试)。
 
-开发本仓库时，可以直接生成 protobuf 代码并使用源码：
-
-```bash
-make init
-export PYTHONPATH="$PWD/src"
-```
-
 ## 连接服务
 
 ```python
@@ -33,23 +26,17 @@ principal = 1001
 token = "user-token"
 ```
 
-`target` 是 gRPC 服务地址。`OpenEventClient` 和 `AdminClient` 都使用固定传输参数创建
-`grpc.insecure_channel`，不接受调用方传入的 channel。需要 TLS 或其他自定义 gRPC 连接参数时，
-直接使用 SDK 生成的 gRPC stub。
+`target` 是 gRPC 服务地址。`OpenEventClient` 和 `AdminClient` 创建并管理明文 gRPC 连接，
+单条收发消息上限为 64 MiB。需要 TLS 或自定义连接参数时，使用 SDK 生成的 gRPC stub。
 
-`OpenEventClient` 和 `AdminClient` 的构造函数都接受 `timeout_ms`，默认值为 30000 毫秒（30 秒）。该值必须是有限且
-大于 0 的数值；`None`、bool、0、负数、NaN 和无穷值都会抛出 `ValueError`，构造和重新赋值使用相同校验。SDK 会把它换算成秒传给
-gRPC 的非流式 RPC 调用。`OpenEventClient.subscribe` 特意不设置 RPC deadline：空闲但健康的订阅会一直保持，
-直到调用方取消、服务端结束或 gRPC 传输失败。
+两种 client 都接受 `timeout_ms`，默认 30000 毫秒（30 秒），用于非流式 RPC。
+构造或重新赋值时须使用大于 0 的有限数值（不含 bool），非法值抛出 `ValueError`。
+订阅持续到调用方取消、服务端结束或连接失败。
 
-`OpenEventClient` 创建的 channel 会对 Subscribe 使用公开的 gRPC 传输层保活策略。这是传输层连通性
-检查，不是 OpenEvent 消息，因此不会出现在订阅中。连接断开后，订阅会结束；如果注册了完成回调，也会执行，
-不需要等待单个 RPC 的 deadline。PING 间隔和兼容性要求以
-[Subscribe API 契约](API_cn.md#37-subscribe) 为准。
+SDK 为订阅启用 gRPC 保活。连接失败时，订阅结束并触发已注册的完成回调；行为见
+[Subscribe API](API_cn.md#37-subscribe)。
 
-client 不再使用时应调用 `client.close()`，也可以把它用作 context manager。`close()` 可以重复调用。
-client 会关闭自己创建的 gRPC channel，取消尚未完成的 RPC，并丢弃未使用的 UUID。
-关闭连接不需要先等 UUID 分配请求完成。析构函数只是在遗漏显式关闭时兜底，因为 Python 不保证它何时执行。
+使用结束后调用 `client.close()`，或使用 context manager。`close()` 可重复调用，会关闭连接并取消未完成的 RPC。
 
 ```python
 with OpenEventClient("127.0.0.1:9527") as scoped_client:
@@ -83,21 +70,12 @@ created = client.create_channel(
 channel_id = created.channel.channel_id
 ```
 
-可见性：
-
-- `VISIBILITY_PUBLIC`：所有已认证用户可读写。
-- `VISIBILITY_PROTECTED`：所有已认证用户可读，成员可写。
-- `VISIBILITY_PRIVATE`：成员可读写。
-
-保留系统 Channel 的 `channel_id=0`、name 为 `system`、protocol 为 `system.v1`。它由服务端拥有且只读。
-每个完成初始化的服务端都永久保存它的 `seq=0` 初始化消息；payload schema 见
-[系统协议](SYSTEM_PROTOCOL_cn.md)。业务 principal 必须大于 0。
+`visibility` 和成员权限见 [Channel ACL](API_cn.md#25-channel-acl)；保留系统 Channel 见
+[系统协议](SYSTEM_PROTOCOL_cn.md)。
 
 ## 发布消息
 
-每次逻辑发布前调用 `get_uuid()` 取出一个 UUID。每个 client 有自己的内存池；池空时调用一次
-`AllocateUuids(count=1024)`，按返回顺序逐个取出。池不持久化、不在 client 间共享，关闭 client 或退出进程
-会丢弃尚未取出的 UUID。发布时显式传入 UUID，SDK 不自动填充或重试。
+每次逻辑发布前调用 `get_uuid()` 领取一个 UUID，发布时显式传入；重试由调用方处理。
 
 最简单的方式是让服务端分配全局 `seq`：
 
@@ -133,26 +111,8 @@ client.publish(
 )
 ```
 
-`payload` 是不透明字节数组，SDK 不解析内容。你可以自行使用 JSON、MessagePack、
-自定义二进制协议或普通文本。
-
-发布结果不确定时，保留 UUID 并按 API 契约 2.9 节的恢复流程处理。最终的重复 UUID 步骤可以无需拉取历史消息即取得已提交 seq：
-
-```python
-import grpc
-
-try:
-    client.publish_auto_seq(principal, token, channel_id, payload, uuid=uuid)
-except grpc.RpcError as exc:
-    if exc.code() != grpc.StatusCode.ALREADY_EXISTS:
-        raise
-    committed_seq = client.get_seq_by_uuid(uuid)
-```
-
-`get_seq_by_uuid()` 返回已被 committed 消息消费的 UUID 所对应的 seq。其协议行为以 API 契约 3.3 节为准。
-
-SDK 创建的 gRPC channel 把单条收发消息上限固定为 64 MiB。读取旧消息所需的传输上限不随当前
-payload 写入限制降低，见 [Payload API](API_cn.md#23-payload)。
+`payload` 使用 bytes。发布结果不确定时，保留原 UUID 并按
+[恢复流程](API_cn.md#29-发布结果不确定时的处理)处理；使用 `client.get_seq_by_uuid(uuid)` 查询已提交消息的位置。
 
 ## 写入和引用对象
 
@@ -184,8 +144,7 @@ published = client.publish_auto_seq(
 )
 ```
 
-使用 ObjectKey 读取 metadata 和字节范围。对象读取不携带 principal token，因为 ObjectKey 本身
-就是授权：
+使用 ObjectKey 授权读取 metadata 和字节范围：
 
 ```python
 metadata = client.get_object_metadata(
@@ -200,9 +159,8 @@ chunk = client.read_object(
 )
 ```
 
-对象不可变、不能为空且最大 4 MiB。ObjectKey 是永久、可转交的 bearer credential；把它附加到
-消息会向所有能读取该消息的调用方披露 capability，包括管理端读取者。禁止记录对象 token。
-精确限制、范围规则、错误和 WriteObject 结果不确定语义见 [API_cn.md](API_cn.md) 的 2.7 和 4 节。
+对象限制、引用授权和错误规则见
+[对象 API](API_cn.md#4-objectstorageservice) 和 [ObjectKey 规则](API_cn.md#27-对象-capability-与消息引用)。
 
 ## 拉取消息
 
@@ -223,21 +181,8 @@ last_seq = response.last_seq
 ```
 
 上例只读取指定业务 Channel，并过滤系统 Channel。继续读取时，把响应的 `next_seq` 作为新的 `from_seq`；
-`next_seq > last_seq` 表示到达本页观察到的尾部。短页或空页不一定表示结束，完整过滤、分页和错误规则见
+以 `next_seq > last_seq` 判断是否到达本页观察到的尾部。完整过滤、分页和错误规则见
 [Fetch API](API_cn.md#36-fetch)。
-
-如果只想读取定向发送给自己的消息：
-
-```python
-response = client.fetch(
-    principal=principal,
-    token=token,
-    from_seq=1,
-    limit=100,
-    channels=[channel_id],
-    only_my_recipient=True,
-)
-```
 
 ## 订阅消息
 
@@ -255,17 +200,15 @@ for item in client.subscribe(
     print(message.seq, message.payload)
 ```
 
-`wait_started(timeout_ms)` 等待服务端发送初始响应 metadata。调用方需要区分“服务端已经接受订阅”和“仍在尝试
-建立连接”时可使用它。`timeout_ms` 必须是大于 0 的有限毫秒数；超时会取消本次 stream 并抛出 `TimeoutError`。
-服务端接受前发生的 RPC 错误原样抛出。成功返回不为已经建立的 stream 设置 deadline，也不等待任何
-OpenEvent 消息。
+`wait_started(timeout_ms)` 等待服务端接受订阅，成功返回 `None`。参数校验与 client 的 `timeout_ms` 相同，
+仅用于本次建立等待；超时会取消 stream 并抛出 `TimeoutError`，接受前的 RPC 错误原样抛出。
 
-上例从 seq 0 开始扫描所选业务 Channel，到达尾部后继续等待新消息。起点边界、权限变化导致的结束或
-过滤，以及服务端关闭后的恢复方式统一见 [Subscribe API](API_cn.md#37-subscribe)。
+订阅到达尾部后继续等待新消息。起点、权限变化和断线恢复见 [Subscribe API](API_cn.md#37-subscribe)。
 
-高层 `OpenEventClient.subscribe` 迭代器会在同一条 stream 内按消息 `seq` 丢弃重复或回退的消息。
-SDK 不自动重连，去重水位也不跨连接。调用方保存最后处理的 seq，并按 API 恢复规则处理重放；需要原始
-stream 时可以直接使用生成式 gRPC stub。
+高层 `OpenEventClient.subscribe` 迭代器要求同一条 stream 内的消息 `seq` 严格递增；首条可以是 0，
+过滤造成的序号间隔也合法。重复或回退表示 stream 违反协议，SDK 会取消该 stream 并抛出 `RuntimeError`，
+异常信息包含前一个序号和本次序号。
+每次订阅独立检查序号。调用方保存最后处理的 seq，并按 API 恢复规则重新订阅。
 
 ## 定向消息
 
@@ -294,10 +237,9 @@ from openevent.sdk import AdminClient
 
 admin = AdminClient("127.0.0.1:9528")
 
-binding = admin.add_token(target_principal=1001).binding
-print("已创建 token，principal:", binding.principal)
+token = admin.add_token(principal=1001).token
 
-admin.delete_token(binding.token)
+admin.delete_token(principal=1001, token=token)
 
 message_page = admin.list_messages(from_seq=0, limit=100)
 for message in message_page.messages:
@@ -305,8 +247,9 @@ for message in message_page.messages:
 
 ```
 
-上例创建并删除 token，再读取一页管理消息。消息下一页使用 `next_seq` 继续。
-管理查询契约见 [AdminService API](API_cn.md#6-adminservice)；部署时必须保护管理端口。
+上例为 principal 1001 取得 token，再删除该 `(principal, token)` 组合，最后读取一页管理消息。
+消息下一页使用 `next_seq` 继续。凭据组合、参数和删除规则见
+[AdminService API](API_cn.md#6-adminservice)；部署时必须保护管理端口。
 
 ## 错误处理
 
