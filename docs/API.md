@@ -2,7 +2,7 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.10.0
+> Version: 0.11.0
 > Date: 2026-09-28
 
 This document defines the public behavior of the business protocol
@@ -71,8 +71,8 @@ Handle errors by gRPC status code.
 ### 2.2 Message Sequence
 
 - `EventMessage.seq` is a globally monotonically increasing message sequence.
-- `seq=0` is the permanent system initialization message. `min_seq=0` and
-  `max_seq=0` mean that only this message exists.
+- `seq=0` is the permanent system initialization message. `max_seq=0` means
+  that only this message exists.
 - Committed values are not reused.
 - Application message seq values advance from `max_seq + 1`. Readers continue
   with the cursor returned by the server.
@@ -198,10 +198,8 @@ rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 - The request must provide a valid `principal` and `token`; `principal=0`
   returns `INVALID_ARGUMENT`, and authentication failures return
   `UNAUTHENTICATED`.
-- `max_seq`: highest committed message seq; 0 when only the system initialization
-  message exists.
-- `min_seq`: always 0 for a valid initialized server, because seq 0 is retained
-  permanently.
+- The response contains only `max_seq`: highest committed message seq; 0 when
+  only the system initialization message exists.
 
 Clients may use `max_seq+1` as the next Publish candidate. A concurrent publish
 can consume it first, causing `ABORTED`.
@@ -535,6 +533,6 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 
 ## 7. Compatibility Guidance
 
-- Version 0.10.0 is incompatible with older protocols and data directories.
+- Version 0.11.0 is incompatible with older protocols and data directories.
   Update the server and SDK together and use a new data directory.
 - Put payload schema rules in the business protocol named by Channel protocol.

@@ -42,7 +42,7 @@ make clean  # 清理构建产物和临时文件
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-端到端测试要求当前 Python 环境已安装 `openevent-sdk>=0.10.0`、`pytest` 和 `packaging`，
+端到端测试要求当前 Python 环境已安装 `openevent-sdk>=0.11.0`、`pytest` 和 `packaging`，
 并提供可执行的服务端二进制文件。日志保存在 `build/e2e/cases/`。
 用 `TEST_ARGS` 传递 pytest 参数，用 `PYTHON` 选择 Python 环境。
 

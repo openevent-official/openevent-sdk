@@ -2,7 +2,7 @@
 
 [English version](API.md)
 
-> 版本: 0.10.0
+> 版本: 0.11.0
 > 日期: 2026-09-28
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
@@ -62,7 +62,7 @@
 ### 2.2 消息序列
 
 - `EventMessage.seq` 是全局单调递增消息序号。
-- `seq=0` 是永久保留的系统初始化消息。`min_seq=0` 且 `max_seq=0` 表示当前只有该消息。
+- `seq=0` 是永久保留的系统初始化消息。`max_seq=0` 表示当前只有该消息。
 - 已提交 seq 不复用。
 - 业务消息 seq 按 `max_seq + 1` 递增；读取方按服务端返回的游标继续扫描。
 - `GetStatus`、`Fetch` 和 `Subscribe` 都使用同一消息序列。
@@ -166,8 +166,7 @@ rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 
 - 请求必须提供有效的 `principal` 和 `token`；`principal=0` 返回 `INVALID_ARGUMENT`，认证失败返回
   `UNAUTHENTICATED`。
-- `max_seq`：最大已提交消息 seq；只有系统初始化消息时为 0。
-- `min_seq`：有效初始化的服务端始终为 0，因为 seq 0 永久保留。
+- 响应仅包含 `max_seq`：最大已提交消息 seq；只有系统初始化消息时为 0。
 
 客户端可以把 `max_seq+1` 作为下一次 Publish 的候选 seq。并发发布先占用该值时，Publish 返回
 `ABORTED`。
@@ -466,5 +465,5 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 
 ## 7. 兼容性建议
 
-- 0.10.0 不兼容旧协议和数据目录，服务端与 SDK 必须配套更新，并使用新数据目录。
+- 0.11.0 不兼容旧协议和数据目录，服务端与 SDK 必须配套更新，并使用新数据目录。
 - payload 的业务 schema 放在 Channel protocol 对应的业务协议中。

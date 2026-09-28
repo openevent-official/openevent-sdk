@@ -47,7 +47,7 @@ Run end-to-end tests against a real OpenEvent server:
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-End-to-end tests require `openevent-sdk>=0.10.0`, `pytest`, and `packaging` to be
+End-to-end tests require `openevent-sdk>=0.11.0`, `pytest`, and `packaging` to be
 installed in the current Python environment, plus an executable server binary.
 Logs are kept under `build/e2e/cases/`. Pass pytest options with `TEST_ARGS` and
 select Python with `PYTHON`.

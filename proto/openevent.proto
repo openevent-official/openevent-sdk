@@ -87,7 +87,8 @@ message GetStatusRequest {
 }
 
 message GetStatusResponse {
-    uint64 min_seq = 1;           // Lowest available message sequence; always 0
+    reserved 1;
+    reserved "min_seq";
     uint64 max_seq = 2;           // Highest committed sequence; 0 means only the system initialization message exists
 }
 

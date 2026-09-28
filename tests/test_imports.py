@@ -390,6 +390,13 @@ def test_proto_service_boundaries_and_admin_field_numbers() -> None:
     assert [dependency.name for dependency in openevent_pb2.DESCRIPTOR.dependencies] == []
     assert [dependency.name for dependency in admin_pb2.DESCRIPTOR.dependencies] == ["openevent.proto"]
 
+    get_status = event_service.methods_by_name["GetStatus"]
+    assert get_status.input_type.full_name == "openevent.GetStatusRequest"
+    assert get_status.output_type.full_name == "openevent.GetStatusResponse"
+    get_status_response = openevent_pb2.GetStatusResponse.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in get_status_response.items()} == {"max_seq": 2}
+    assert get_status_response["max_seq"].type == get_status_response["max_seq"].TYPE_UINT64
+
     add_token = admin_service.methods_by_name["AddToken"]
     assert add_token.input_type.full_name == "openevent.AddTokenRequest"
     assert add_token.output_type.full_name == "openevent.AddTokenResponse"

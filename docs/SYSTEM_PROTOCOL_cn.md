@@ -90,7 +90,7 @@ payload 不包含 `seq`、`channel_id`、`principal` 或 `uuid`；这些值由�
 
 ## 6. 序列与读取
 
-`min_seq=0`；`max_seq=0` 表示当前只有初始化消息。业务消息从 `seq=1` 开始，详见
+`max_seq=0` 表示当前只有初始化消息。业务消息从 `seq=1` 开始，详见
 [消息序列](API_cn.md#22-消息序列)。
 
 `from_seq=0` 包含初始化消息，是否返回取决于请求的过滤条件。

@@ -1224,7 +1224,7 @@ def test_system_initialization_and_zero_start(admin, client):
     assert not system.HasField("creator") and not system.members
     assert client.get_seq_by_uuid(0) == 0
     status = client.get_status(2001, token)
-    assert status.min_seq == status.max_seq == 0
+    assert status.max_seq == 0
     assert [c.channel_id for c in client.list_channels(2001, token).channels] == [0]
     for mode in (openevent_pb2.CHANNEL_FILTER_JOINED, openevent_pb2.CHANNEL_FILTER_OWNED):
         assert not client.list_channels(2001, token, filter=mode).channels

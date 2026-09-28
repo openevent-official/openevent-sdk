@@ -99,7 +99,7 @@ client allocation or publishing.
 
 ## 6. Sequence and Reads
 
-`min_seq=0`; `max_seq=0` means only the initialization message exists.
+`max_seq=0` means only the initialization message exists.
 Application messages begin at `seq=1`; see [message sequence](API.md#22-message-sequence).
 
 `from_seq=0` includes the initialization message when it matches the request's filters.
