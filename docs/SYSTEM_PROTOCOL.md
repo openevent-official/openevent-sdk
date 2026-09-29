@@ -48,9 +48,6 @@ The initialization message payload is a UTF-8 JSON object:
   "kind": "system.initialization",
   "data": {
     "schema_version": 1
-  },
-  "timestamps": {
-    "event_ms": 1710000000000
   }
 }
 ```
@@ -62,7 +59,6 @@ Field rules:
 | `kind` | string, required, exactly `system.initialization` |
 | `data` | object, required |
 | `data.schema_version` | integer, required, currently `1` |
-| `timestamps.event_ms` | non-negative JSON integer, required, Unix epoch milliseconds |
 
 The payload does not contain `seq`, `channel_id`, `principal`, or `uuid`.
 Those values are carried by the enclosing `EventMessage`.
@@ -83,10 +79,11 @@ The one system initialization message MUST have these enclosing fields:
 | `uuid` | `0` |
 | `ts_ms` | Unix epoch milliseconds of the first initialization commit |
 
-`ts_ms` and `timestamps.event_ms` identify the same initialization event time,
-MUST be equal, and are set by the server. Initialization completes only after
-the message is durably committed. The server MUST create it exactly once for a
-new data root, retain it permanently, and never recreate it on restart.
+The initialization event time is stored only in the enclosing `ts_ms`, which
+is set by the server; the payload does not duplicate the time. Initialization
+completes only after the message is durably committed. The server MUST create
+it exactly once for a new data root, retain it permanently, and never recreate
+it on restart.
 
 ## 5. Reserved Principal and UUID
 

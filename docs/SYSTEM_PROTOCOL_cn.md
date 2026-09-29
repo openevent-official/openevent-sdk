@@ -43,9 +43,6 @@ members    = []
   "kind": "system.initialization",
   "data": {
     "schema_version": 1
-  },
-  "timestamps": {
-    "event_ms": 1710000000000
   }
 }
 ```
@@ -57,7 +54,6 @@ members    = []
 | `kind` | string，必填，固定为 `system.initialization` |
 | `data` | object，必填 |
 | `data.schema_version` | integer，必填，当前为 `1` |
-| `timestamps.event_ms` | 非负 JSON integer，必填，Unix epoch 毫秒时间戳 |
 
 payload 不包含 `seq`、`channel_id`、`principal` 或 `uuid`；这些值由外层
 `EventMessage` 承载。
@@ -78,7 +74,7 @@ payload 不包含 `seq`、`channel_id`、`principal` 或 `uuid`；这些值由�
 | `uuid` | `0` |
 | `ts_ms` | 首次初始化提交时的 Unix epoch 毫秒时间戳 |
 
-`ts_ms` 和 `timestamps.event_ms` 表示同一个初始化事件时间，必须相等并由服务端设置。只有该消息持久提交后
+初始化事件时间仅保存在外层 `ts_ms`，由服务端设置，payload 不重复保存时间。只有该消息持久提交后
 初始化才完成。服务端必须在新数据根目录中恰好创建一次、永久保留，并且重启时不得重新创建。
 
 ## 5. 保留 Principal 与 UUID

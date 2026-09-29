@@ -1236,7 +1236,6 @@ def test_system_initialization_and_zero_start(admin, client):
     assert not message.recipients and not message.object_keys
     assert json.loads(message.payload) == {
         "kind": "system.initialization", "data": {"schema_version": 1},
-        "timestamps": {"event_ms": message.ts_ms},
     }
     assert client.fetch(2001, token, 0, 1).messages[0] == message
     assert not client.fetch(2001, token, 0, 1, only_my_recipient=True).messages
