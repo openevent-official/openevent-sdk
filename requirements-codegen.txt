@@ -1,0 +1,4 @@
+# Keep the generator paired with the minimum supported SDK runtime versions.
+grpcio-tools==1.62.3
+grpcio==1.62.3
+protobuf==4.25.3

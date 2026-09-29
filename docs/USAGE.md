@@ -213,10 +213,20 @@ for item in client.subscribe(
     print(message.seq, message.payload)
 ```
 
-`wait_started(timeout_ms)` waits for the server to accept the subscription and
-returns `None` on success. Its argument follows the client's `timeout_ms`
-validation and applies only to this establishment wait. A timeout cancels the
-stream and raises `TimeoutError`; RPC errors before acceptance propagate unchanged.
+`wait_started(timeout_ms)` waits for the acceptance marker defined by the
+[Subscribe API](API.md#37-subscribe) in the initial metadata. It returns `None`
+on success and remembers that this stream was accepted. Even if the stream has
+already ended before the first call, the method succeeds when its initial
+metadata contains the marker; subsequent calls also succeed. It does not
+guarantee that the stream is still open. Obtain errors after acceptance through
+iteration or `code()`.
+
+Without the acceptance marker, the SDK waits for the final gRPC status. A non-`OK`
+status propagates the call's original `grpc.RpcError`; `OK` raises `RuntimeError`
+because the subscription ended without confirmation. The argument follows the
+client's `timeout_ms` validation and applies only to this establishment wait.
+A timeout cancels the stream and raises `TimeoutError`, without setting a
+deadline for the entire stream.
 
 Subscriptions wait for new messages at the tail. Starting positions, permission
 changes, and reconnection are defined in the [Subscribe API](API.md#37-subscribe).

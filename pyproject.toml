@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openevent-sdk"
-version = "0.11.0"
+version = "0.11.1"
 description = "Python SDK for OpenEvent"
 requires-python = ">=3.8"
 dependencies = [
-    "grpcio",
-    "protobuf",
+    "grpcio>=1.62.3",
+    "protobuf>=4.25.3",
 ]
 
 [project.optional-dependencies]

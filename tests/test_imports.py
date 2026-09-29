@@ -341,23 +341,33 @@ def test_subscribe_rejects_duplicate_and_backward_sequences(previous, received) 
     assert underlying.read_count == 2
 
 
-def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
+@pytest.mark.parametrize("wait_for_metadata", [True, False])
+def test_subscribe_wait_started_is_public_and_cancels_on_timeout(wait_for_metadata) -> None:
     class ReadyStream:
         def initial_metadata(self):
-            return ()
+            return (("unrelated", "value"), ("openevent-subscription", "accepted"))
+
+        def code(self):
+            raise AssertionError("an accepted stream must not wait for its final status")
 
     ready = client_module._SubscribeStream(ReadyStream())
+    assert ready.wait_started(1_000) is None
     assert ready.wait_started(1_000) is None
 
     release = Event()
 
-    class PendingStream:
+    class PendingStream(client_module.grpc.RpcError):
         def __init__(self):
             self.cancelled = False
 
         def initial_metadata(self):
-            release.wait()
+            if wait_for_metadata:
+                release.wait()
             return ()
+
+        def code(self):
+            release.wait()
+            return client_module.grpc.StatusCode.CANCELLED
 
         def cancel(self):
             self.cancelled = True
@@ -366,10 +376,13 @@ def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
 
     pending_stream = PendingStream()
     pending = client_module._SubscribeStream(pending_stream)
-    with pytest.raises(TimeoutError, match="initial metadata"):
-        pending.wait_started(10)
-    assert pending_stream.cancelled
-    assert release.wait(1)
+    try:
+        with pytest.raises(TimeoutError, match="server acceptance metadata"):
+            pending.wait_started(10)
+        assert pending_stream.cancelled
+    finally:
+        release.set()
+        assert pending._started.wait(1), "the cancelled handshake waiter did not exit"
 
     with pytest.raises(ValueError, match="timeout_ms must be a finite number greater than 0"):
         ready.wait_started(0)
@@ -383,8 +396,52 @@ def test_subscribe_wait_started_is_public_and_cancels_on_timeout() -> None:
         failed.wait_started(1_000)
 
 
+@pytest.mark.parametrize("metadata", [
+    (),
+    (("unrelated", "accepted"),),
+    (("openevent-subscription", "pending"),),
+    (("openevent-subscription", "Accepted"),),
+])
+@pytest.mark.parametrize("status", [
+    client_module.grpc.StatusCode.UNAVAILABLE,
+    client_module.grpc.StatusCode.OK,
+])
+def test_subscribe_wait_started_requires_the_exact_acceptance_marker(metadata, status) -> None:
+    class FinishedStream(client_module.grpc.RpcError):
+        def initial_metadata(self):
+            return metadata
+
+        def code(self):
+            return status
+
+    underlying = FinishedStream()
+    stream = client_module._SubscribeStream(underlying)
+    if status == client_module.grpc.StatusCode.OK:
+        with pytest.raises(RuntimeError, match="without server acceptance metadata"):
+            stream.wait_started(1_000)
+    else:
+        with pytest.raises(client_module.grpc.RpcError) as rejected:
+            stream.wait_started(1_000)
+        assert rejected.value is underlying
+
+
+def test_subscribe_wait_started_preserves_acceptance_after_stream_ends() -> None:
+    class AcceptedThenClosed:
+        def initial_metadata(self):
+            return (("openevent-subscription", "accepted"),)
+
+        def code(self):
+            return client_module.grpc.StatusCode.UNAVAILABLE
+
+    stream = client_module._SubscribeStream(AcceptedThenClosed())
+    assert stream.wait_started(1_000) is None
+
+
 def test_proto_service_boundaries_and_admin_field_numbers() -> None:
-    assert "AdminService" not in openevent_pb2.DESCRIPTOR.services_by_name
+    assert set(openevent_pb2.DESCRIPTOR.services_by_name) == {
+        "EventService", "ObjectStorageService", "ChannelService",
+    }
+    assert set(admin_pb2.DESCRIPTOR.services_by_name) == {"AdminService"}
     event_service = openevent_pb2.DESCRIPTOR.services_by_name["EventService"]
     admin_service = admin_pb2.DESCRIPTOR.services_by_name["AdminService"]
     assert [dependency.name for dependency in openevent_pb2.DESCRIPTOR.dependencies] == []
@@ -394,7 +451,7 @@ def test_proto_service_boundaries_and_admin_field_numbers() -> None:
     assert get_status.input_type.full_name == "openevent.GetStatusRequest"
     assert get_status.output_type.full_name == "openevent.GetStatusResponse"
     get_status_response = openevent_pb2.GetStatusResponse.DESCRIPTOR.fields_by_name
-    assert {name: field.number for name, field in get_status_response.items()} == {"max_seq": 2}
+    assert {name: field.number for name, field in get_status_response.items()} == {"max_seq": 1}
     assert get_status_response["max_seq"].type == get_status_response["max_seq"].TYPE_UINT64
 
     add_token = admin_service.methods_by_name["AddToken"]

@@ -87,9 +87,7 @@ message GetStatusRequest {
 }
 
 message GetStatusResponse {
-    reserved 1;
-    reserved "min_seq";
-    uint64 max_seq = 2;           // Highest committed sequence; 0 means only the system initialization message exists
+    uint64 max_seq = 1;           // Highest committed sequence; 0 means only the system initialization message exists
 }
 
 message PublishRequest {

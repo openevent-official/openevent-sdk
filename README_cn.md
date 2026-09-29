@@ -10,7 +10,10 @@ Python SDK 提供消息、对象、Channel 和管理接口的轻量客户端，�
 
 ## 构建和测试
 
-构建、测试和安装统一通过 `make` 执行。需要 Python、`protoc` 和 `grpc_python_plugin`，后两个命令必须在 `PATH` 中。
+构建、测试和安装统一通过 `make` 执行；协议生成使用 Python 3.8–3.12 和 pip。生成脚本按
+[requirements-codegen.txt](requirements-codegen.txt) 将固定版本的 Python 协议生成工具安装到
+`build/codegen-deps/`，不依赖 `PATH` 中的 `protoc` 或 `grpc_python_plugin`。
+安装已发布 wheel 所需的 Python 和运行依赖版本由 [pyproject.toml](pyproject.toml) 声明；生成工具不进入 SDK wheel。
 
 构建并安装 SDK：
 
@@ -42,7 +45,7 @@ make clean  # 清理构建产物和临时文件
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-端到端测试要求当前 Python 环境已安装 `openevent-sdk>=0.11.0`、`pytest` 和 `packaging`，
+端到端测试要求当前 Python 环境已安装 `openevent-sdk>=0.11.1`、`pytest` 和 `packaging`，
 并提供可执行的服务端二进制文件。日志保存在 `build/e2e/cases/`。
 用 `TEST_ARGS` 传递 pytest 参数，用 `PYTHON` 选择 Python 环境。
 

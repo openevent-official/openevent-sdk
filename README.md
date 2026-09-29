@@ -12,8 +12,13 @@ See the [usage guide](docs/USAGE.md) for examples.
 
 ## Build and Test
 
-Build, test, and install tasks are wrapped by `make`. Python, `protoc`, and
-`grpc_python_plugin` are required; the latter two commands must be on `PATH`.
+Build, test, and install tasks are wrapped by `make`. Use Python 3.8–3.12 and pip
+for protocol generation.
+The generation script installs pinned Python protocol generators from
+[requirements-codegen.txt](requirements-codegen.txt) into `build/codegen-deps/`;
+it does not depend on `protoc` or `grpc_python_plugin` from `PATH`.
+Python and runtime dependency versions for published wheels are declared in [pyproject.toml](pyproject.toml).
+The generators are not included in the SDK wheel.
 
 Build and install the SDK:
 
@@ -47,7 +52,7 @@ Run end-to-end tests against a real OpenEvent server:
 OPENEVENT_SERVER_BIN=<openevent_server_binary> make e2e
 ```
 
-End-to-end tests require `openevent-sdk>=0.11.0`, `pytest`, and `packaging` to be
+End-to-end tests require `openevent-sdk>=0.11.1`, `pytest`, and `packaging` to be
 installed in the current Python environment, plus an executable server binary.
 Logs are kept under `build/e2e/cases/`. Pass pytest options with `TEST_ARGS` and
 select Python with `PYTHON`.

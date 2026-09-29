@@ -110,9 +110,3 @@ Starting-sequence, pagination, and error rules for each reader are defined in
 
 The system message has no recipients, so `only_my_recipient=true` filters it
 out under the normal recipient rules.
-
-## 7. Versioning
-
-- `system.v1` is the current system payload protocol.
-- Backward-compatible additions may extend the `data` object.
-- Breaking changes use a new protocol identifier, such as `system.v2`.

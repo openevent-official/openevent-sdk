@@ -2,8 +2,8 @@
 
 [English version](API.md)
 
-> 版本: 0.11.0
-> 日期: 2026-09-28
+> 版本: 0.11.1
+> 日期: 2026-09-29
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
 [`proto/admin.proto`](../proto/admin.proto) 的公开 API 行为。
@@ -295,8 +295,10 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 取消或断开后，从最后已处理的 `seq+1` 重新订阅或 Fetch；也可以从最后已处理 seq 包含式重订阅，
 由调用方过滤重放。
 
-认证、显式 Channel 校验和起点 seq 校验成功后，服务端会在等待或推送任何 OpenEvent 消息之前发送 gRPC 初始响应 metadata。
-该 metadata 表示订阅已被接受，即使当前全部消息都被过滤。
+认证、显式 Channel 校验和起点 seq 校验成功后，服务端会在等待或推送任何 OpenEvent 消息之前发送 gRPC
+初始响应 metadata，其中固定键值 `openevent-subscription: accepted` 是订阅已被接受的唯一确认标记。
+即使当前全部消息都被过滤，服务端也会发送该标记。空 metadata、其他键值或该键的其他值都不表示接受；
+服务端在接受前拒绝订阅时不得发送该标记。
 
 Subscribe stream 持续保持打开，直到发生中断。业务 gRPC 端口在传输层 30 秒没有活动后发送
 一次 HTTP/2 PING；10 秒内收不到确认就关闭连接。服务端只接受间隔不少于 20 秒的客户端 PING。Python
@@ -462,8 +464,3 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 - last_seq 是查询开始时的最大已提交消息序号。
 - 起点超过尾部时返回空页和尾部下一位置；`next_seq > last_seq` 表示到达本页观察到的尾部。
 - 每页是一致视图，但并发追加可使后续页的 last_seq 增大。
-
-## 7. 兼容性建议
-
-- 0.11.0 不兼容旧协议和数据目录，服务端与 SDK 必须配套更新，并使用新数据目录。
-- payload 的业务 schema 放在 Channel protocol 对应的业务协议中。

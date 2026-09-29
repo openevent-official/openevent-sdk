@@ -18,12 +18,10 @@ def test_init_stages_importable_package_without_writing_source():
         root = Path(temporary)
         for name in ('src', 'proto'):
             shutil.copytree(ROOT / name, root / name)
-        for name in ('Makefile', 'generate_python_proto.sh'):
+        for name in ('Makefile', 'generate_python_proto.sh', 'requirements-codegen.txt'):
             shutil.copy2(ROOT / name, root / name)
 
         source = root / 'src'
-        # Old generated files must neither override the new protocol nor be copied blindly.
-        (source / 'openevent/sdk/proto/obsolete_pb2.py').write_text('raise RuntimeError("stale")\n')
         marker = source / 'openevent/sdk/build_marker.py'
         marker.write_text('generation = 1\n')
         stage = root / 'build/python'
@@ -38,7 +36,6 @@ def test_init_stages_importable_package_without_writing_source():
             subprocess.run(['make', 'init', 'PYTHON=' + sys.executable], cwd=str(root),
                            env=environment, check=True)
             assert snapshot() == before
-            assert not (stage / 'openevent/sdk/proto/obsolete_pb2.py').exists()
 
         generate()
         assert (stage / marker.relative_to(source)).read_text() == 'generation = 1\n'

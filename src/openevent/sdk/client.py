@@ -8,12 +8,7 @@ from typing import Iterable
 
 import grpc
 
-try:
-    from .proto import openevent_pb2, openevent_pb2_grpc
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "generated protobuf modules are missing; run make build from openevent-sdk"
-    ) from exc
+from .proto import openevent_pb2, openevent_pb2_grpc
 
 
 _DEFAULT_MAX_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024
@@ -66,7 +61,7 @@ class _SubscribeStream:
         return item
 
     def wait_started(self, timeout_ms: object) -> None:
-        """Wait up to timeout_ms for server acceptance without setting a stream deadline."""
+        """Wait for server acceptance, even if the accepted stream has since ended."""
         timeout_seconds = _validate_timeout_ms(timeout_ms) / 1000.0
         with self._started_lock:
             if not self._started_waiter_started:
@@ -75,16 +70,20 @@ class _SubscribeStream:
 
         if not self._started.wait(timeout_seconds):
             self.cancel()
-            raise TimeoutError("Subscribe did not receive server initial metadata before timeout")
+            raise TimeoutError("Subscribe did not receive server acceptance metadata before timeout")
         if self._started_error is not None:
             raise self._started_error
 
     def _await_initial_metadata(self) -> None:
         try:
             metadata = self._stream.initial_metadata()
-            if not metadata and hasattr(self._stream, "done") and self._stream.done():
-                if self._stream.code() != grpc.StatusCode.OK:
-                    raise self._stream
+            if ("openevent-subscription", "accepted") in (metadata or ()):
+                return
+            # Initial metadata can arrive before the final status. Wait for that
+            # status instead of treating an unfinished call as accepted.
+            if self._stream.code() != grpc.StatusCode.OK:
+                raise self._stream
+            raise RuntimeError("Subscribe ended without server acceptance metadata")
         except Exception as exc:
             self._started_error = exc
         finally:

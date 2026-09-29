@@ -200,8 +200,13 @@ for item in client.subscribe(
     print(message.seq, message.payload)
 ```
 
-`wait_started(timeout_ms)` 等待服务端接受订阅，成功返回 `None`。参数校验与 client 的 `timeout_ms` 相同，
-仅用于本次建立等待；超时会取消 stream 并抛出 `TimeoutError`，接受前的 RPC 错误原样抛出。
+`wait_started(timeout_ms)` 等待初始 metadata 中出现 [Subscribe API](API_cn.md#37-subscribe) 规定的接受标记，
+成功返回 `None`，并记住该 stream 曾被接受。即使首次调用时 stream 已经结束，只要初始 metadata 包含
+该标记，仍然成功；后续重复调用也成功。它不保证 stream 当前仍然打开，接受后的错误由迭代或 `code()` 获取。
+
+没有接受标记时，SDK 等待最终 gRPC 状态：非 `OK` 时原样抛出该调用的 `grpc.RpcError`；`OK` 时抛出
+`RuntimeError`，表示订阅未经确认就已结束。参数校验与 client 的 `timeout_ms` 相同，仅用于本次建立等待；
+等待超时会取消 stream 并抛出 `TimeoutError`，不会给整个 stream 设置 deadline。
 
 订阅到达尾部后继续等待新消息。起点、权限变化和断线恢复见 [Subscribe API](API_cn.md#37-subscribe)。
 

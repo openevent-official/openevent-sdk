@@ -612,6 +612,7 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
     max_seq = client.get_status(principal=principal, token=token).max_seq
     boundary = client.subscribe(principal=principal, token=token, from_seq=max_seq + 1)
     boundary.wait_started(5_000)
+    assert ("openevent-subscription", "accepted") in boundary.initial_metadata()
     executor = ThreadPoolExecutor(max_workers=1)
     pending = executor.submit(next, boundary)
     try:
@@ -634,6 +635,7 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
     with pytest.raises(grpc.RpcError) as exc_info:
         invalid_boundary.wait_started(5_000)
     _assert_rpc_code(exc_info, grpc.StatusCode.OUT_OF_RANGE)
+    assert ("openevent-subscription", "accepted") not in invalid_boundary.initial_metadata()
 
 
 def test_subscribe_channel_filter(admin: AdminClient, client: OpenEventClient) -> None:
@@ -755,6 +757,7 @@ def test_subscribe_wait_started_before_selected_channel_message(
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         stream.wait_started(5_000)
+        assert ("openevent-subscription", "accepted") in stream.initial_metadata()
         pending = executor.submit(next, stream)
         time.sleep(0.1)
         assert not pending.done()
@@ -1440,28 +1443,40 @@ def test_filtered_pagination_reaches_later_visible_messages(admin, client):
 
 def test_wait_started_distinguishes_acceptance_from_rejection(admin, client):
     token = _token(admin, 2701)
+    owner_token = _token(admin, 2702)
+    private_channel = client.create_channel(
+        2702, owner_token, name=_unique("sdk-e2e-rejected-subscription"),
+        visibility=openevent_pb2.VISIBILITY_PRIVATE,
+    ).channel.channel_id
     for fields, expected in [
         ({"principal": 0, "token": token}, grpc.StatusCode.INVALID_ARGUMENT),
         ({"principal": 2701, "token": "wrong"}, grpc.StatusCode.UNAUTHENTICATED),
         ({"principal": 2701, "token": token, "from_seq": 2}, grpc.StatusCode.OUT_OF_RANGE),
         ({"principal": 2701, "token": token, "channels": [999]}, grpc.StatusCode.NOT_FOUND),
+        (
+            {"principal": 2701, "token": token, "channels": [private_channel]},
+            grpc.StatusCode.PERMISSION_DENIED,
+        ),
     ]:
         stream = client.subscribe(**fields)
         try:
             with pytest.raises(grpc.RpcError) as error:
                 stream.wait_started(5_000)
             assert error.value.code() == expected
+            assert ("openevent-subscription", "accepted") not in stream.initial_metadata()
         finally:
             stream.cancel()
     stream = client.subscribe(2701, token, only_my_recipient=True)
     try:
         # Receive acceptance directly so wait_started is first called after stream termination.
-        stream.initial_metadata()
+        accepted_metadata = stream.initial_metadata()
+        assert ("openevent-subscription", "accepted") in accepted_metadata
         ended = Event()
         stream.add_done_callback(lambda _: ended.set())
         admin.delete_token(2701, token)
         assert ended.wait(5)
         assert stream.wait_started(5_000) is None
+        assert stream.initial_metadata() == accepted_metadata
         with pytest.raises(grpc.RpcError) as error:
             next(stream)
         assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED

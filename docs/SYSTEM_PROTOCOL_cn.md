@@ -99,9 +99,3 @@ payload 不包含 `seq`、`channel_id`、`principal` 或 `uuid`；这些值由�
 和 [ListMessages](API_cn.md#62-listmessages)。
 
 系统消息没有 recipients，因此 `only_my_recipient=true` 按普通 recipient 规则会将其过滤掉。
-
-## 7. 版本策略
-
-- `system.v1` 是当前系统 payload 协议。
-- 向后兼容的增强可以扩展 `data` object。
-- 破坏性变更使用新的 protocol 标识，例如 `system.v2`。

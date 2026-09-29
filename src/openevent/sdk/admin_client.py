@@ -4,12 +4,7 @@ import grpc
 
 from .client import _DEFAULT_CHANNEL_OPTIONS, _DEFAULT_RPC_TIMEOUT_MS, _validate_timeout_ms
 
-try:
-    from .proto import admin_pb2, admin_pb2_grpc
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "generated protobuf modules are missing; run make build from openevent-sdk"
-    ) from exc
+from .proto import admin_pb2, admin_pb2_grpc
 
 
 class AdminClient:

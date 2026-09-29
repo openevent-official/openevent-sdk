@@ -2,8 +2,8 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.11.0
-> Date: 2026-09-28
+> Version: 0.11.1
+> Date: 2026-09-29
 
 This document defines the public behavior of the business protocol
 [`proto/openevent.proto`](../proto/openevent.proto) and management protocol
@@ -334,8 +334,12 @@ inclusively from the last processed seq and filter the replay.
 
 After authentication, explicit Channel validation, and starting-sequence
 validation succeed, the server sends gRPC initial response metadata before it
-waits for or pushes an OpenEvent message. This metadata confirms acceptance
-even when all current messages are filtered out.
+waits for or pushes an OpenEvent message. The fixed metadata entry
+`openevent-subscription: accepted` is the sole confirmation that the subscription
+has been accepted. The server sends this marker even when all current messages
+are filtered out. Empty metadata, unrelated entries, or any other value for this
+key do not confirm acceptance. The server must not send the marker when rejecting
+a subscription before acceptance.
 
 A Subscribe stream stays open until interrupted. The public gRPC endpoint sends
 an HTTP/2 PING after 30 seconds without transport activity and closes a connection
@@ -530,9 +534,3 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 - A cursor beyond the tail returns an empty page and the tail's next position.
   `next_seq > last_seq` means the page has reached its observed tail.
 - Concurrent appends may increase last_seq on later pages.
-
-## 7. Compatibility Guidance
-
-- Version 0.11.0 is incompatible with older protocols and data directories.
-  Update the server and SDK together and use a new data directory.
-- Put payload schema rules in the business protocol named by Channel protocol.
