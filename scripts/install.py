@@ -23,7 +23,15 @@ def main():
     if len(wheels) != 1:
         sys.exit('Exactly one SDK wheel from a successful make build is required')
 
-    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', PIP_NO_COMPILE='1')
+    # Reuse the build script's working directories; its exports do not survive
+    # into this separate make recipe.
+    temporary = ROOT / 'build/tmp'
+    pycache = ROOT / 'build/pycache'
+    temporary.mkdir(parents=True, exist_ok=True)
+    pycache.mkdir(parents=True, exist_ok=True)
+    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', PIP_NO_COMPILE='1',
+                       TMPDIR=str(temporary), PYTHONPYCACHEPREFIX=str(pycache),
+                       PIP_NO_CACHE_DIR='1', PIP_DISABLE_PIP_VERSION_CHECK='1')
     pip = [sys.executable, '-B', '-m', 'pip', 'install', '--no-compile']
     # Resolve declared dependencies normally, then replace only the SDK itself.
     # A dependency failure must leave the installed SDK unchanged.

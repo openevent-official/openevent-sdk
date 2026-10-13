@@ -104,6 +104,40 @@ def _messages_by_payload(messages: Iterable, payload: bytes):
     return [message for message in messages if message.payload == payload]
 
 
+def _take_messages(stream, count):
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(lambda: [next(stream).message for _ in range(count)])
+        try:
+            return pending.result(timeout=5)
+        finally:
+            stream.cancel()
+
+
+def _assert_system_message(message, channel_id, kind):
+    assert message.channel_id == channel_id
+    assert message.seq > 0 and message.uuid > 0 and message.ts_ms > 0
+    assert message.principal == 0
+    assert not message.recipients and not message.object_keys
+    envelope = json.loads(message.payload)
+    assert set(envelope) == {"kind", "data"}
+    assert envelope["kind"] == kind
+    assert envelope["data"]["schema_version"] == 1
+    return envelope["data"]
+
+
+def _assert_channel_initialized(message, channel):
+    data = _assert_system_message(message, channel.channel_id, "system.channel_initialized")
+    assert sorted(data.pop("members")) == sorted(channel.members)
+    assert data == {
+        "schema_version": 1,
+        "name": channel.name,
+        "protocol": channel.protocol,
+        "description": channel.description,
+        "visibility": {0: "public", 1: "protected", 2: "private"}[channel.visibility],
+        "creator": channel.creator,
+    }
+
+
 class _TcpRelay:
     def __init__(self, upstream_target: str):
         host, port = upstream_target.rsplit(":", 1)
@@ -590,6 +624,9 @@ def test_subscribe_from_history_and_future_boundary(admin: AdminClient, client: 
 
     future_stream = client.subscribe(principal=principal, token=token, from_seq=0)
     assert next(future_stream).message.seq == 0
+    initialization = next(future_stream).message
+    assert initialization.channel_id == channel_id and initialization.principal == 0
+    assert initialization.seq < history_seq
     assert next(future_stream).message.seq == history_seq
     executor = ThreadPoolExecutor(max_workers=1)
     pending = executor.submit(next, future_stream)
@@ -1001,6 +1038,80 @@ def test_uncertain_publish_result_is_reconciled_by_uuid_lookup(
     assert client.get_seq_by_uuid(cas_uuid) == cas_seq
 
 
+@pytest.mark.parametrize("method", ["publish", "publish_auto_seq"])
+@pytest.mark.parametrize(
+    "visibility",
+    [openevent_pb2.VISIBILITY_PROTECTED, openevent_pb2.VISIBILITY_PRIVATE],
+    ids=["protected", "private"],
+)
+def test_uncertain_publish_retry_after_member_removal(
+    admin: AdminClient, client: OpenEventClient, method: str, visibility: int
+) -> None:
+    owner, member = 1711, 1712
+    owner_token = _token(admin, owner)
+    member_token = _token(admin, member)
+    channel_id = client.create_channel(
+        principal=owner,
+        token=owner_token,
+        name=_unique("sdk-e2e-reconcile-after-removal"),
+        visibility=visibility,
+        members=[member],
+    ).channel.channel_id
+    committed_seq = client.get_status(principal=owner, token=owner_token).max_seq + 1
+    original_uuid = client.get_uuid()
+    request = {
+        "principal": member,
+        "token": member_token,
+        "channel_id": channel_id,
+        "payload": b"committed before member removal",
+        "uuid": original_uuid,
+    }
+    if method == "publish":
+        request["seq"] = committed_seq
+
+    with _commit_then_abort_client() as proxy:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            getattr(proxy, method)(**request)
+        _assert_rpc_code(exc_info, grpc.StatusCode.UNAVAILABLE)
+
+    client.remove_member(
+        principal=owner,
+        token=owner_token,
+        channel_id=channel_id,
+        target_principal=member,
+    )
+    # The member's token remains valid; only the Channel permission was revoked.
+    after_removal = client.get_status(principal=member, token=member_token).max_seq
+    assert after_removal == committed_seq + 1
+
+    # Reuse the exact uncertain request, including Publish's now-stale CAS seq.
+    with pytest.raises(grpc.RpcError) as exc_info:
+        getattr(client, method)(**request)
+    _assert_rpc_code(exc_info, grpc.StatusCode.ALREADY_EXISTS)
+    assert client.get_seq_by_uuid(original_uuid) == committed_seq
+
+    new_request = {**request, "uuid": client.get_uuid()}
+    if method == "publish":
+        new_request["seq"] = after_removal + 1
+    with pytest.raises(grpc.RpcError) as exc_info:
+        getattr(client, method)(**new_request)
+    _assert_rpc_code(exc_info, grpc.StatusCode.PERMISSION_DENIED)
+    assert client.get_status(principal=owner, token=owner_token).max_seq == after_removal
+
+    messages = client.fetch(
+        principal=owner,
+        token=owner_token,
+        from_seq=committed_seq,
+        limit=10,
+        channels=[channel_id],
+    ).messages
+    matching = [message for message in messages if message.uuid == original_uuid]
+    assert len(matching) == 1
+    assert matching[0].seq == committed_seq
+    assert matching[0].principal == member
+    assert matching[0].payload == request["payload"]
+
+
 def test_object_write_metadata_and_partial_read(admin: AdminClient, client: OpenEventClient) -> None:
     principal = 1801
     token = _token(admin, principal)
@@ -1240,7 +1351,8 @@ def test_system_initialization_and_zero_start(admin, client):
     assert client.fetch(2001, token, 0, 1).messages[0] == message
     assert not client.fetch(2001, token, 0, 1, only_my_recipient=True).messages
     channel = client.create_channel(2001, token, _unique("filtered-system")).channel.channel_id
-    assert not client.fetch(2001, token, 0, 1, channels=[channel]).messages
+    filtered = client.fetch(2001, token, 0, 1, channels=[channel]).messages
+    assert len(filtered) == 1 and filtered[0].channel_id == channel and filtered[0].seq > 0
     stream = client.subscribe(2001, token)
     try:
         stream.wait_started(5_000)
@@ -1252,6 +1364,7 @@ def test_system_initialization_and_zero_start(admin, client):
 def test_reserved_principals_and_system_mutations(admin, client):
     token = _token(admin, 2002)
     channel = client.create_channel(2002, token, _unique("reserved")).channel.channel_id
+    before = client.get_status(2002, token).max_seq
     invalid = [
         lambda: admin.add_token(0), lambda: admin.delete_token(2002, ""),
         lambda: admin.delete_token(0, token), lambda: admin.delete_token(0, ""),
@@ -1279,7 +1392,7 @@ def test_reserved_principals_and_system_mutations(admin, client):
         with pytest.raises(grpc.RpcError) as error:
             call()
         assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
-    assert client.get_status(2002, token).max_seq == 0
+    assert client.get_status(2002, token).max_seq == before
     admin.delete_token(2002, "absent-token")
     admin.delete_token(2002, "absent-token")
 
@@ -1333,6 +1446,11 @@ def test_subscription_observes_member_removal_and_token_deletion(admin, client, 
                 next(stream)
             assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
             return
+        if visibility == openevent_pb2.VISIBILITY_PROTECTED:
+            removed = next(stream).message
+            assert _assert_system_message(removed, private, "system.member_removed") == {
+                "schema_version": 1, "member": member,
+            }
         private_seq = client.publish_auto_seq(owner, owner_token, private, b"after-private", client.get_uuid()).seq
         public_seq = client.publish_auto_seq(owner, owner_token, public, b"after-public", client.get_uuid()).seq
         assert next(stream).message.seq == (private_seq if visibility == 1 else public_seq)
@@ -1346,20 +1464,44 @@ def test_subscription_observes_member_removal_and_token_deletion(admin, client, 
 
 def test_channel_creation_parameter_limits(admin, client):
     token = _token(admin, 2301)
-    # 1024 request members plus the creator is a legal 1025-member result.
+    before = client.get_status(2301, token).max_seq
+    with pytest.raises(grpc.RpcError) as error:
+        client.create_channel(2301, token, "too-many-members", members=range(3000, 4024))
+    assert error.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert client.get_status(2301, token).max_seq == before
+
+    # The creator counts toward the total, whether supplied or added automatically.
     channel = client.create_channel(2301, token, "n" * 255, protocol="p" * 255,
-        description="d" * 4096, members=range(3000, 4024)).channel
-    assert len(channel.members) == 1025 and 2301 in channel.members
+        description="d" * 4096, members=range(3000, 4023)).channel
+    assert len(channel.members) == 1024 and list(channel.members).count(2301) == 1
+    explicit_creator = client.create_channel(2301, token, "explicit-creator",
+        members=[2301, *range(3000, 4023)]).channel
+    assert len(explicit_creator.members) == 1024 and list(explicit_creator.members).count(2301) == 1
+
+    before = client.get_status(2301, token).max_seq
+    for member, expected_code in ((5000, grpc.StatusCode.RESOURCE_EXHAUSTED),
+                                  (3000, grpc.StatusCode.ALREADY_EXISTS),
+                                  (2301, grpc.StatusCode.ALREADY_EXISTS)):
+        with pytest.raises(grpc.RpcError) as error:
+            client.add_member(2301, token, channel.channel_id, member)
+        assert error.value.code() == expected_code
+        assert client.get_status(2301, token).max_seq == before
+    assert client.get_channel(2301, token, channel.channel_id).channel == channel
+
+    client.remove_member(2301, token, channel.channel_id, 3000)
     client.add_member(2301, token, channel.channel_id, 5000)
-    assert len(client.get_channel(2301, token, channel.channel_id).channel.members) == 1026
-    duplicates = client.create_channel(2301, token, "duplicates", members=[2301, 2302, 2302]).channel
+    replaced = client.get_channel(2301, token, channel.channel_id).channel
+    assert len(replaced.members) == 1024 and 3000 not in replaced.members and 5000 in replaced.members
+    duplicates = client.create_channel(2301, token, "duplicates", members=[2301] + [2302] * 1023).channel
     assert list(duplicates.members) == [2301, 2302]
+    before = client.get_status(2301, token).max_seq
     for fields in ({"name": ""}, {"name": "n" * 256}, {"name": "名" * 86},
                    {"protocol": "p" * 256}, {"description": "d" * 4097}, {"members": [2301] * 1025}):
         arguments = {"name": "valid", **fields}
         with pytest.raises(grpc.RpcError) as error:
             client.create_channel(2301, token, **arguments)
         assert error.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert client.get_status(2301, token).max_seq == before
 
 
 @pytest.mark.parametrize("large", [False, True])
@@ -1447,10 +1589,11 @@ def test_wait_started_distinguishes_acceptance_from_rejection(admin, client):
         2702, owner_token, name=_unique("sdk-e2e-rejected-subscription"),
         visibility=openevent_pb2.VISIBILITY_PRIVATE,
     ).channel.channel_id
+    too_far = client.get_status(2701, token).max_seq + 2
     for fields, expected in [
         ({"principal": 0, "token": token}, grpc.StatusCode.INVALID_ARGUMENT),
         ({"principal": 2701, "token": "wrong"}, grpc.StatusCode.UNAUTHENTICATED),
-        ({"principal": 2701, "token": token, "from_seq": 2}, grpc.StatusCode.OUT_OF_RANGE),
+        ({"principal": 2701, "token": token, "from_seq": too_far}, grpc.StatusCode.OUT_OF_RANGE),
         ({"principal": 2701, "token": token, "channels": [999]}, grpc.StatusCode.NOT_FOUND),
         (
             {"principal": 2701, "token": token, "channels": [private_channel]},
@@ -1481,3 +1624,235 @@ def test_wait_started_distinguishes_acceptance_from_rejection(admin, client):
         assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
     finally:
         stream.cancel()
+
+
+def test_channel_events_share_sequences_and_uuid_allocation(admin, client):
+    """E2E-SDK-011: successful mutations persist one event, no-ops consume nothing."""
+    owner, member, added = 2801, 2802, 2803
+    token = _token(admin, owner)
+
+    def allocate_one():
+        return client.event_stub.AllocateUuids(
+            openevent_pb2.AllocateUuidsRequest(count=1), timeout=5,
+        ).uuids[0]
+
+    reserved = [allocate_one()]
+    before = client.get_status(owner, token).max_seq
+    channel = client.create_channel(
+        owner, token, '会话 "quoted"\nname', protocol="chat.v1",
+        description='line one\nline two \\ "quoted"',
+        visibility=openevent_pb2.VISIBILITY_PRIVATE, members=[owner, member, member],
+    ).channel
+    assert set(channel.members) == {owner, member} and len(channel.members) == 2
+    assert client.get_channel(owner, token, channel.channel_id).channel == channel
+    assert client.get_status(owner, token).max_seq == before + 1
+    initialized = client.fetch(owner, token, before + 1, 10).messages
+    assert len(initialized) == 1
+    _assert_channel_initialized(initialized[0], channel)
+
+    reserved.append(allocate_one())
+    client.add_member(owner, token, channel.channel_id, added)
+    assert client.get_status(owner, token).max_seq == before + 2
+    assert set(client.get_channel(owner, token, channel.channel_id).channel.members) == {
+        owner, member, added,
+    }
+    joined = client.fetch(owner, token, before + 2, 10).messages
+    assert len(joined) == 1
+    assert _assert_system_message(joined[0], channel.channel_id, "system.member_added") == {
+        "schema_version": 1, "member": added,
+    }
+
+    reserved.append(allocate_one())
+    client.remove_member(owner, token, channel.channel_id, member)
+    assert client.get_status(owner, token).max_seq == before + 3
+    assert set(client.get_channel(owner, token, channel.channel_id).channel.members) == {owner, added}
+    removed = client.fetch(owner, token, before + 3, 10).messages
+    assert len(removed) == 1
+    assert _assert_system_message(removed[0], channel.channel_id, "system.member_removed") == {
+        "schema_version": 1, "member": member,
+    }
+
+    reserved.append(allocate_one())
+    with pytest.raises(grpc.RpcError) as error:
+        client.add_member(owner, token, channel.channel_id, added)
+    assert error.value.code() == grpc.StatusCode.ALREADY_EXISTS
+    client.remove_member(owner, token, channel.channel_id, member)
+    assert client.get_status(owner, token).max_seq == before + 3
+    reserved.append(allocate_one())
+    assert reserved[-1] == reserved[-2] + 1
+
+    events = list(client.fetch(owner, token, 0, 100, channels=[channel.channel_id]).messages)
+    assert events == [initialized[0], joined[0], removed[0]]
+    assert [message.seq for message in events] == list(range(before + 1, before + 4))
+    assert len({message.uuid for message in events}) == 3
+    assert {message.uuid for message in events}.isdisjoint(reserved)
+    for message in events:
+        assert client.get_seq_by_uuid(message.uuid) == message.seq
+
+    # Previously allocated business UUIDs remain valid after system events use the allocator.
+    published = []
+    for uuid in reserved:
+        seq = client.publish_auto_seq(owner, token, channel.channel_id, b"opaque business payload", uuid).seq
+        published.append(seq)
+        assert client.get_seq_by_uuid(uuid) == seq
+    fetched = client.fetch(owner, token, 0, 100, channels=[channel.channel_id]).messages
+    assert list(fetched[:3]) == events
+    assert [message.seq for message in fetched[3:]] == published
+    assert all(message.principal == owner and message.payload == b"opaque business payload"
+               for message in fetched[3:])
+    assert client.get_channel(owner, token, channel.channel_id).channel.protocol == "chat.v1"
+
+
+def test_all_readable_subscription_discovers_new_channels_and_resumes(admin, client):
+    """E2E-SDK-011: an already accepted stream discovers future private channels."""
+    owner, agent = 2811, 2812
+    token, agent_token = _token(admin, owner), _token(admin, agent)
+    start = client.get_status(agent, agent_token).max_seq + 1
+    stream = client.subscribe(agent, agent_token, from_seq=start, channels=[])
+    try:
+        stream.wait_started(5_000)
+        channel = client.create_channel(
+            owner, token, _unique("new-chat"), protocol="chat.v1",
+            visibility=openevent_pb2.VISIBILITY_PRIVATE, members=[agent],
+        ).channel
+        published = client.publish_auto_seq(
+            owner, token, channel.channel_id, b"first business message", client.get_uuid(),
+        ).seq
+        messages = _take_messages(stream, 2)
+    finally:
+        stream.cancel()
+    _assert_channel_initialized(messages[0], channel)
+    assert messages[0].seq == start and messages[1].seq == published == start + 1
+    assert messages[1].principal == owner and messages[1].payload == b"first business message"
+    assert list(client.fetch(agent, agent_token, start, 10).messages) == messages
+
+    # A channel created while disconnected is discovered from the saved cursor too.
+    later = client.create_channel(
+        owner, token, _unique("offline-chat"), protocol="chat.v1",
+        visibility=openevent_pb2.VISIBILITY_PRIVATE, members=[agent],
+    ).channel
+    later_seq = client.publish_auto_seq(
+        owner, token, later.channel_id, b"while disconnected", client.get_uuid(),
+    ).seq
+    resumed = client.subscribe(agent, agent_token, from_seq=published + 1)
+    restored = _take_messages(resumed, 2)
+    _assert_channel_initialized(restored[0], later)
+    assert restored[1].seq == later_seq and restored[1].payload == b"while disconnected"
+
+
+def test_history_watermark_then_subscribe_keeps_channels_created_during_recovery(admin, client):
+    """E2E-SDK-011: Fetch to H and Subscribe from H+1 need no channel enumeration."""
+    owner, agent = 2821, 2822
+    token, agent_token = _token(admin, owner), _token(admin, agent)
+    old = client.create_channel(
+        owner, token, _unique("history-chat"), protocol="chat.v1",
+        visibility=openevent_pb2.VISIBILITY_PRIVATE, members=[agent],
+    ).channel
+    old_seq = client.publish_auto_seq(owner, token, old.channel_id, b"old", client.get_uuid()).seq
+    watermark = client.get_status(agent, agent_token).max_seq
+    first = client.fetch(agent, agent_token, from_seq=0, limit=1, channels=[])
+    assert first.next_seq <= watermark
+
+    created_during_recovery = client.create_channel(
+        owner, token, _unique("during-recovery"), protocol="chat.v1",
+        visibility=openevent_pb2.VISIBILITY_PRIVATE, members=[agent],
+    ).channel
+    new_seq = client.publish_auto_seq(
+        owner, token, created_during_recovery.channel_id, b"new", client.get_uuid(),
+    ).seq
+
+    history, cursor = list(first.messages), first.next_seq
+    saw_after_watermark = False
+    while cursor <= watermark:
+        page = client.fetch(agent, agent_token, cursor, 100, channels=[])
+        assert page.next_seq > cursor
+        saw_after_watermark |= any(message.seq > watermark for message in page.messages)
+        history.extend(message for message in page.messages if message.seq <= watermark)
+        cursor = page.next_seq
+    assert saw_after_watermark, "the recovery page must include messages beyond its fixed watermark"
+    assert history[0].seq == 0
+    _assert_channel_initialized(history[1], old)
+    assert history[2].seq == old_seq == watermark and history[2].payload == b"old"
+    assert len(history) == 3
+
+    live = _take_messages(client.subscribe(agent, agent_token, from_seq=watermark + 1), 2)
+    _assert_channel_initialized(live[0], created_during_recovery)
+    assert live[0].seq == watermark + 1
+    assert live[1].seq == new_seq and live[1].payload == b"new"
+    assert [message.seq for message in history + live] == list(range(new_seq + 1))
+
+
+@pytest.mark.parametrize("visibility", [0, 1, 2])
+def test_channel_system_events_follow_acl_and_recipient_filtering(admin, client, visibility):
+    """E2E-SDK-011: readable does not imply membership; system events have no recipients."""
+    owner, reader, member = 2831, 2832, 2833
+    token, reader_token = _token(admin, owner), _token(admin, reader)
+    channel = client.create_channel(
+        owner, token, _unique("event-acl"), visibility=visibility,
+        protocol="application/octet-stream",
+    ).channel
+    client.add_member(owner, token, channel.channel_id, member)
+    client.remove_member(owner, token, channel.channel_id, member)
+    own_events = client.fetch(owner, token, 0, 100, channels=[channel.channel_id]).messages
+    assert len(own_events) == 3
+    _assert_channel_initialized(own_events[0], channel)
+    for message, kind in zip(own_events[1:], ("system.member_added", "system.member_removed")):
+        assert _assert_system_message(message, channel.channel_id, kind) == {
+            "schema_version": 1, "member": member,
+        }
+    assert not client.fetch(owner, token, 0, 100, only_my_recipient=True).messages
+
+    all_visible = client.fetch(reader, reader_token, 0, 100, channels=[]).messages
+    if visibility == openevent_pb2.VISIBILITY_PRIVATE:
+        assert all(message.channel_id != channel.channel_id for message in all_visible)
+        with pytest.raises(grpc.RpcError) as error:
+            client.fetch(reader, reader_token, 0, 100, channels=[channel.channel_id])
+        assert error.value.code() == grpc.StatusCode.PERMISSION_DENIED
+    else:
+        assert reader not in client.get_channel(reader, reader_token, channel.channel_id).channel.members
+        assert [message for message in all_visible if message.channel_id == channel.channel_id] == list(own_events)
+        stream = client.subscribe(reader, reader_token, from_seq=0, channels=[channel.channel_id])
+        assert _take_messages(stream, 3) == list(own_events)
+
+    # The next addressed business message is the first visible result, even when
+    # subscription scanning starts before all three empty-recipient system events.
+    stream = client.subscribe(owner, token, from_seq=0, only_my_recipient=True)
+    try:
+        stream.wait_started(5_000)
+        seq = client.publish_auto_seq(
+            owner, token, channel.channel_id, b"direct", client.get_uuid(), recipients=[owner],
+        ).seq
+        assert _take_messages(stream, 1)[0].seq == seq
+    finally:
+        stream.cancel()
+
+
+def test_all_readable_subscription_receives_new_membership_without_old_history(admin, client):
+    """E2E-SDK-011: new read access affects future batches, not the consumed prefix."""
+    owner, agent = 2841, 2842
+    token, agent_token = _token(admin, owner), _token(admin, agent)
+    channel = client.create_channel(
+        owner, token, _unique("join-existing"), protocol="chat.v1",
+        visibility=openevent_pb2.VISIBILITY_PRIVATE,
+    ).channel
+    old_seq = client.publish_auto_seq(owner, token, channel.channel_id, b"old", client.get_uuid()).seq
+    # The explicit starting cursor is past the inaccessible prefix, so the
+    # result does not depend on how quickly a background batch scanned it.
+    stream = client.subscribe(agent, agent_token, from_seq=old_seq + 1)
+    try:
+        stream.wait_started(5_000)
+        client.add_member(owner, token, channel.channel_id, agent)
+        new_seq = client.publish_auto_seq(owner, token, channel.channel_id, b"new", client.get_uuid()).seq
+        messages = _take_messages(stream, 2)
+    finally:
+        stream.cancel()
+    assert _assert_system_message(messages[0], channel.channel_id, "system.member_added") == {
+        "schema_version": 1, "member": agent,
+    }
+    assert messages[0].seq == old_seq + 1 and messages[1].seq == new_seq
+    assert messages[1].payload == b"new"
+    current = client.get_channel(agent, agent_token, channel.channel_id).channel
+    assert current.protocol == "chat.v1" and agent in current.members
+    history = client.fetch(agent, agent_token, 0, 100, channels=[channel.channel_id]).messages
+    _assert_channel_initialized(history[0], channel)
+    assert history[1].seq == old_seq and history[1].payload == b"old"

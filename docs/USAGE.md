@@ -35,9 +35,12 @@ message. Use the generated gRPC stubs for TLS or custom connection options.
 Both clients accept `timeout_ms`, defaulting to 30000 milliseconds (30 seconds),
 for non-streaming RPCs. Construction and reassignment require a finite number
 greater than zero, excluding booleans; invalid values raise `ValueError`.
+`timeout_ms` controls how long an ordinary RPC waits for its result, not the
+subscription lifetime or connection keepalive.
 Subscriptions continue until cancelled, ended by the server, or disconnected.
 
-The SDK enables gRPC keepalive for subscriptions. A connection failure ends the
+`OpenEventClient` enables gRPC keepalive for subscriptions; `AdminClient` uses
+gRPC's default keepalive settings. A connection failure ends the subscription
 stream and invokes registered completion callbacks; see the
 [Subscribe API](API.md#37-subscribe).
 
@@ -58,6 +61,12 @@ with OpenEventClient("127.0.0.1:9527") as scoped_client:
 | `subscribe(...)` | A gRPC-compatible stream iterator yielding `SubscribeResponse` values |
 | Other business and admin RPC wrapper methods | The original protobuf response, including RPCs with empty responses |
 
+The SDK returns messages unchanged, without parsing or filtering system messages.
+Ordinary Channels also contain system messages: callers first identify messages
+with `message.principal == 0` and handle them according to the
+[system protocol](SYSTEM_PROTOCOL.md), then parse other messages according to
+the Channel's application protocol.
+
 ## Create a Channel
 
 ```python
@@ -77,7 +86,10 @@ channel_id = created.channel.channel_id
 ```
 
 See [Channel ACL](API.md#25-channel-acl) for `visibility` and member permissions,
-and [the system protocol](SYSTEM_PROTOCOL.md) for the reserved system Channel.
+and [the system protocol](SYSTEM_PROTOCOL.md) for initialization messages written
+when Channels are created, membership-change messages, and the reserved system
+Channel. An ordinary Channel's `protocol` still identifies its application-message
+protocol.
 
 ## Publish Messages
 
@@ -191,8 +203,9 @@ next_seq = response.next_seq
 last_seq = response.last_seq
 ```
 
-The example reads only the selected application Channel and filters out the
-system Channel. Use the response's `next_seq` as the next `from_seq` to continue;
+The example reads only the selected Channel, including its system and application
+messages; it does not read Channel 0. Use the response's `next_seq` as the next
+`from_seq` to continue;
 use `next_seq > last_seq` to determine whether the tail observed by this page was
 reached. Full filtering, pagination, and error rules are in
 the [Fetch API](API.md#36-fetch).
@@ -238,6 +251,21 @@ the SDK cancels that stream and raises `RuntimeError` with the previous and
 received sequence values.
 Each subscription checks its sequence independently. Save the last processed seq
 and resubscribe according to the API resume rules.
+
+## Discover Channels Through Messages
+
+Applications can rebuild their Channel lists from historical messages and then
+discover new Channels through subscriptions, without periodically calling
+`ListChannels`. At startup, use `get_status` to record message watermark `H`, then
+read from `from_seq=0` through that watermark using
+`fetch(channels=[], only_my_recipient=False)`, handling system events and restoring
+application state. Continue receiving currently readable messages with
+`subscribe(from_seq=H+1, channels=[], only_my_recipient=False)`.
+
+See the [system protocol](SYSTEM_PROTOCOL.md) for message contents and
+[Discovering Channels Through Messages](API.md#38-discovering-channels-through-messages)
+for the full reading, handoff, and permission rules. The SDK does not maintain
+Channel lists or recovery progress.
 
 ## Targeted Messages
 

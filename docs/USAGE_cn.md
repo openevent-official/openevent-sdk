@@ -31,9 +31,11 @@ token = "user-token"
 
 两种 client 都接受 `timeout_ms`，默认 30000 毫秒（30 秒），用于非流式 RPC。
 构造或重新赋值时须使用大于 0 的有限数值（不含 bool），非法值抛出 `ValueError`。
+`timeout_ms` 控制普通 RPC 等待结果的时间，不控制订阅持续时间或连接保活。
 订阅持续到调用方取消、服务端结束或连接失败。
 
-SDK 为订阅启用 gRPC 保活。连接失败时，订阅结束并触发已注册的完成回调；行为见
+`OpenEventClient` 为订阅启用 gRPC 保活；`AdminClient` 使用 gRPC 默认保活设置。
+连接失败时，订阅结束并触发已注册的完成回调；行为见
 [Subscribe API](API_cn.md#37-subscribe)。
 
 使用结束后调用 `client.close()`，或使用 context manager。`close()` 可重复调用，会关闭连接并取消未完成的 RPC。
@@ -51,6 +53,10 @@ with OpenEventClient("127.0.0.1:9527") as scoped_client:
 | `get_seq_by_uuid(uuid)` | Python `int`，表示该 UUID 对应的已提交消息 seq |
 | `subscribe(...)` | 兼容 gRPC stream 的迭代器，每次产出一个 `SubscribeResponse` |
 | 其余业务和管理 RPC 封装方法 | 对应的原始 protobuf response，包括返回空 response 的 RPC |
+
+SDK 原样返回消息，不解析或过滤系统消息。读取普通 Channel 时也会收到系统消息：调用方先按
+`message.principal == 0` 识别并按[系统协议](SYSTEM_PROTOCOL_cn.md)处理，再按 Channel 的业务协议
+解析其他消息。
 
 ## 创建 Channel
 
@@ -70,8 +76,9 @@ created = client.create_channel(
 channel_id = created.channel.channel_id
 ```
 
-`visibility` 和成员权限见 [Channel ACL](API_cn.md#25-channel-acl)；保留系统 Channel 见
-[系统协议](SYSTEM_PROTOCOL_cn.md)。
+`visibility` 和成员权限见 [Channel ACL](API_cn.md#25-channel-acl)；创建 Channel 时写入的初始化消息、
+成员变更消息及保留系统 Channel 见[系统协议](SYSTEM_PROTOCOL_cn.md)。普通 Channel 的 `protocol`
+仍表示其业务消息协议。
 
 ## 发布消息
 
@@ -180,7 +187,8 @@ next_seq = response.next_seq
 last_seq = response.last_seq
 ```
 
-上例只读取指定业务 Channel，并过滤系统 Channel。继续读取时，把响应的 `next_seq` 作为新的 `from_seq`；
+上例只读取指定 Channel，包括其中的系统消息和业务消息，不读取 Channel 0。
+继续读取时，把响应的 `next_seq` 作为新的 `from_seq`；
 以 `next_seq > last_seq` 判断是否到达本页观察到的尾部。完整过滤、分页和错误规则见
 [Fetch API](API_cn.md#36-fetch)。
 
@@ -214,6 +222,16 @@ for item in client.subscribe(
 过滤造成的序号间隔也合法。重复或回退表示 stream 违反协议，SDK 会取消该 stream 并抛出 `RuntimeError`，
 异常信息包含前一个序号和本次序号。
 每次订阅独立检查序号。调用方保存最后处理的 seq，并按 API 恢复规则重新订阅。
+
+## 通过消息发现 Channel
+
+应用可以从历史消息重建所需的 Channel 列表，再通过订阅发现新 Channel，无需定时调用 `ListChannels`。
+启动时用 `get_status` 记录消息水位 `H`，从 `from_seq=0` 开始用 `fetch(channels=[], only_my_recipient=False)`
+读取到该水位，处理系统事件并恢复应用状态；随后用
+`subscribe(from_seq=H+1, channels=[], only_my_recipient=False)` 继续接收当前有权读取的消息。
+
+系统消息的内容见[系统协议](SYSTEM_PROTOCOL_cn.md)；完整的读取、交接与权限规则见
+[通过消息发现 Channel](API_cn.md#38-通过消息发现-channel)。SDK 不维护 Channel 列表或恢复进度。
 
 ## 定向消息
 

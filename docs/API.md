@@ -2,8 +2,8 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.11.1
-> Date: 2026-09-29
+> Version: 0.12.0
+> Date: 2026-10-13
 
 This document defines the public behavior of the business protocol
 [`proto/openevent.proto`](../proto/openevent.proto) and management protocol
@@ -12,21 +12,24 @@ This document defines the public behavior of the business protocol
 ## 1. Basic Conventions
 
 - All APIs use `gRPC + Protocol Buffers`.
-- A valid initialized server always contains the permanent system initialization
-  message at `seq=0`; application messages start at `seq=1`.
+- A valid initialized server always contains the permanent global initialization
+  message at `seq=0`. Subsequent application messages and Channel system messages
+  share the global message sequence starting at `seq=1`.
 - Each application `EventMessage` contains `ts_ms`, the Unix millisecond
-  timestamp when the server received the publish request. For seq 0 it is the
-  initialization event time defined by `system.v1`.
-- Each application `EventMessage` contains a nonzero `uuid` allocated by
-  `AllocateUuids`. The system initialization message is the sole exception and
-  uses `uuid=0` and `principal=0`.
-- Application `payload` is stored as opaque bytes. The server-generated seq-0 system payload follows the
-  separate `system.v1` protocol.
+  timestamp when the server received the publish request.
+- Application messages use nonzero UUIDs allocated by `AllocateUuids`. The server
+  obtains nonzero UUIDs for Channel system messages from the same allocator.
+  Only the global initialization message uses `uuid=0`.
+- Application `payload` is stored as opaque bytes. Identification, fields, and
+  payload schemas for all server-generated system messages are defined in the
+  [system protocol](SYSTEM_PROTOCOL.md). Readers distinguish system messages
+  before parsing application messages according to the Channel's application protocol.
 - Business principals must be greater than zero. `principal=0` is reserved for
   server-generated system behavior. Zero in a business or token-management request
   principal, Channel creator/member, recipient, or object-creator position returns
   `INVALID_ARGUMENT`.
-- OpenEvent permanently retains committed messages, Channel metadata, and immutable objects.
+- OpenEvent permanently retains committed messages, Channel metadata, and immutable
+  objects within the current data history. Section 1.2 defines that history's scope.
 
 ### 1.1 Services
 
@@ -36,6 +39,27 @@ This document defines the public behavior of the business protocol
 | `ObjectStorageService` | Immutable object writes, metadata queries, and partial data reads |
 | `ChannelService` | Channel creation, queries, listing, and member management |
 | `AdminService` | Token management and administrative message queries |
+
+### 1.2 Data History and Backup Restoration
+
+Monotonic allocation and non-reuse of message `seq`, UUIDs, Channel IDs, and
+object IDs, permanent retention of messages and objects, and permanent validity
+of ObjectKeys are all scoped to the current data history. Normal restart or crash
+recovery using the complete data directory preserves that history.
+
+Restoring an older backup switches to a different data history rather than
+continuing the history that existed before restoration. Restored state and
+allocation watermarks come from the backup. Changes made in the previous history
+after that backup are absent, and their sequence numbers and IDs may be allocated again.
+Messages, Channels, objects, tokens, and ObjectKeys present in the restored backup
+remain usable according to the restored state and this contract; restoration
+does not additionally revoke those credentials.
+
+Reading progress, subscription cursors, and pending UUID retry state from the
+previous history must not be carried straight into the restored history.
+Resource references are resolved within the restored data history. Current
+interfaces carry no data history identifier and do not automatically recognize
+or convert cursors, retry state, or references across histories.
 
 ## 2. Common Semantics
 
@@ -48,7 +72,7 @@ This document defines the public behavior of the business protocol
 | `NOT_FOUND` | Channel does not exist, or an object capability is absent or invalid |
 | `ALREADY_EXISTS` | Resource already exists, such as an existing member or a UUID already used by a message |
 | `INVALID_ARGUMENT` | Missing/invalid fields or invalid recipients |
-| `RESOURCE_EXHAUSTED` | payload exceeds its limit or object-file storage has insufficient space/quota/inodes |
+| `RESOURCE_EXHAUSTED` | payload or total Channel membership exceeds its limit, or object-file storage has insufficient space/quota/inodes |
 | `OUT_OF_RANGE` | ReadObject offset is greater than the object size, or Subscribe starts beyond `max_seq + 1` |
 | `ABORTED` | `Publish.req.seq != max_seq + 1` |
 | `CANCELLED` | The call was cancelled; a write result may be uncertain |
@@ -71,26 +95,35 @@ Handle errors by gRPC status code.
 ### 2.2 Message Sequence
 
 - `EventMessage.seq` is a globally monotonically increasing message sequence.
-- `seq=0` is the permanent system initialization message. `max_seq=0` means
+- `seq=0` is the permanent global initialization message. `max_seq=0` means
   that only this message exists.
 - Committed values are not reused.
-- Application message seq values advance from `max_seq + 1`. Readers continue
-  with the cursor returned by the server.
+- Application messages and Channel system messages both advance seq from
+  `max_seq + 1`. Readers continue with the cursor returned by the server.
+  Channel creation and actual membership changes also advance `max_seq` and can
+  cause a concurrent Publish seq CAS to return `ABORTED`.
 - `GetStatus`, `Fetch`, and `Subscribe` all use this sequence.
 
 ### 2.3 Payload
 
 - `Publish` and `PublishAutoSeq` accept payload, which may be empty.
-- The deployment's `max_payload_bytes` setting limits only publish request payloads.
+- The deployment's `max_payload_bytes` setting limits only application publish
+  request payloads, not server-generated system messages.
 - Oversized payload returns `RESOURCE_EXHAUSTED` and creates no message.
 - Fetch, Subscribe, and administrative ListMessages return complete historical
   payloads even after the write limit is lowered. Page budgets determine page boundaries.
 
 ### 2.4 Message UUIDs
 
-- UUID 0 is reserved for the system initialization message.
+- UUID 0 is reserved for the global initialization message.
 - Every Publish and PublishAutoSeq request must carry one nonzero UUID returned by AllocateUuids.
-- The initialization message participates in normal UUID lookup, and
+- Channel system messages share the UUID allocator with AllocateUuids. The server
+  allocates and consumes their UUIDs in the same commit as the corresponding
+  Channel mutation. System messages do not consume UUIDs allocated to clients.
+- A Channel mutation that does not commit or does not actually change state
+  neither allocates nor consumes a UUID and does not advance the message sequence.
+  Other concurrent operations may still advance the watermarks.
+- The global initialization message participates in normal UUID lookup, and
   `GetSeqByUuid(0)` returns `seq=0`. Clients cannot allocate or publish with
   UUID 0. For client publishes, a UUID not allocated by the server returns
   `INVALID_ARGUMENT`; a UUID already consumed by a committed message returns
@@ -112,7 +145,10 @@ Handle errors by gRPC status code.
 
 System Channel `channel_id=0` is read-only for all authenticated callers. Its
 fixed fields, list membership, and initialization message are defined in
-[`SYSTEM_PROTOCOL.md`](SYSTEM_PROTOCOL.md).
+[`SYSTEM_PROTOCOL.md`](SYSTEM_PROTOCOL.md). System messages in an ordinary
+Channel follow that Channel's current read permission, without special delivery
+permissions. A caller removed from a private Channel is not guaranteed to read
+the removal event.
 
 ### 2.6 Recipients
 
@@ -147,13 +183,18 @@ fixed fields, list membership, and initialization message are defined in
   committed state preceding the message commit. No token or Channel mutation can
   intervene between those checks and the commit.
 - If RemoveMember commits first on a protected or private Channel, a later publish
-  by that removed member returns `PERMISSION_DENIED`; public Channel writes are not
-  controlled by membership. If DeleteToken commits first, a later publish using
+  by that removed member using an unconsumed UUID returns `PERMISSION_DENIED`;
+  public Channel writes are not controlled by membership. If DeleteToken commits first, a later publish using
   that deleted pair returns `UNAUTHENTICATED`; the same token string under another
   principal is unaffected. A message committed first remains valid.
 - WriteObject may interleave with other operations while processing. Only a fully
   and durably committed object is visible to reads and message references; that
   complete commit is the write's ordering point.
+- CreateChannel, an actual member addition, and an actual member removal each
+  commit atomically with one corresponding Channel system message. Channel
+  metadata, the system message, UUID allocation and consumption, and `max_seq`
+  either all commit or none do. The initialization message is the new Channel's
+  first message, preceding all application and membership-change messages in it.
 - A write returns success only after it has been synchronously and durably
   persisted. Success means the mutation satisfies the server durability contract.
 - A non-streaming read issued after a write RPC returned success must observe the
@@ -199,10 +240,10 @@ rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   returns `INVALID_ARGUMENT`, and authentication failures return
   `UNAUTHENTICATED`.
 - The response contains only `max_seq`: highest committed message seq; 0 when
-  only the system initialization message exists.
+  only the global initialization message exists.
 
-Clients may use `max_seq+1` as the next Publish candidate. A concurrent publish
-can consume it first, causing `ABORTED`.
+Clients may use `max_seq+1` as the next Publish candidate. A concurrent application
+publish or Channel system message can consume it first, causing `ABORTED`.
 
 ### 3.2 AllocateUuids
 
@@ -214,6 +255,7 @@ The request contains only `count`, which must be in `1..1024`. The response cont
 monotonically increasing, contiguous UUIDs in increasing order. Allocation is unauthenticated and does not create a
 message. A successful call durably advances the allocation watermark; allocated UUIDs are never reused, including
 when no message consumes them. Allocation alone does not make a UUID queryable through GetSeqByUuid.
+Channel system messages advance the same allocation watermark, so UUIDs from consecutive calls need not be adjacent.
 
 ### 3.3 GetSeqByUuid
 
@@ -222,7 +264,7 @@ rpc GetSeqByUuid(GetSeqByUuidRequest) returns (GetSeqByUuidResponse);
 ```
 
 The request contains only `uuid`; it carries no `principal` or `token`. This unauthenticated read does not change
-allocation or message state. UUID 0 returns `seq=0` for the system initialization message. For other UUIDs, the
+allocation or message state. UUID 0 returns `seq=0` for the global initialization message. For other UUIDs, the
 server returns `NOT_FOUND` unless the UUID has already been consumed by a committed message, including when the UUID
 was never allocated or was allocated but has not been used. On success, `seq` is the committed message sequence that
 consumed the UUID.
@@ -314,8 +356,11 @@ relative to concurrent RPCs. Each batch
 uses a consistent read view covering commits completed before that batch began;
 those commits become visible by the next successful 100 ms view refresh.
 
-With no channels specified, a permission change makes later batches filter out
-private Channels that are no longer readable; it does not end the whole stream.
+With no channels specified, later batches automatically include newly created
+readable Channels and Channels for which the caller gains read permission,
+without rebuilding the subscription. Previously filtered and consumed messages
+are not replayed. A permission change makes later batches filter out private
+Channels that are no longer readable; it does not end the whole stream.
 Removing a member from a protected Channel does not change read permission.
 Deleting the subscription's `principal + token` pair makes the next batch return
 `UNAUTHENTICATED` and end the stream.
@@ -345,15 +390,51 @@ A Subscribe stream stays open until interrupted. The public gRPC endpoint sends
 an HTTP/2 PING after 30 seconds without transport activity and closes a connection
 whose PING acknowledgement does not
 arrive within 10 seconds. It accepts client PINGs no more frequent than every 20
-seconds. The Python high-level client sends client PINGs every 30 seconds and
-does not set a deadline for Subscribe; a caller using another gRPC client or a
+seconds. The Python high-level client sends client PINGs every 30 seconds, closes
+its connection if no acknowledgement arrives within 10 seconds, and does not set
+a deadline for Subscribe; a caller using another gRPC client or a
 generated stub must configure a compatible transport keepalive policy on its own
 channel.
+
+These intervals detect broken connections; they are not RPC execution deadlines.
+The client chooses each RPC's deadline. The Python high-level client's
+`timeout_ms` applies only to non-streaming RPCs and does not change the server's
+keepalive intervals. Each peer detects connection failure and releases its own
+connection; a network interruption can prevent client cancellation from reaching
+the server.
+An otherwise healthy connection that acknowledges PINGs does not time out a
+subscription merely because there are no application messages.
 
 When the server begins normal or fatal shutdown, it actively ends every
 established Subscribe stream. Treat this like any other stream interruption:
 record the last processed `seq` and use the resume rule above with Subscribe or
 Fetch.
+
+### 3.8 Discovering Channels Through Messages
+
+Callers can discover Channels from [Channel system messages](SYSTEM_PROTOCOL.md)
+while restoring message history, without an initial or periodic ListChannels
+call. Initialization and ongoing subscription use the same message handling:
+
+1. Call GetStatus and record the fixed watermark `H=max_seq`.
+2. Fetch from `from_seq=0` with `channels=[]` and `only_my_recipient=false`.
+   Follow `next_seq` and process only messages with `seq<=H`. History reading is
+   complete only when `next_seq>H`, never merely because a page is short or empty.
+3. Handle system messages according to the system protocol. The caller decides
+   which readable Channels belong in its application list using protocol and
+   membership information. Read permission does not imply membership. If only
+   a member-added event was received and Channel attributes are missing, call
+   GetChannel once with that `channel_id`; no history replay or list scan is needed.
+4. After restoring history, start Subscribe with `from_seq=H+1`, `channels=[]`,
+   and `only_my_recipient=false`. Messages committed during recovery are read
+   from this point. Resume after interruptions according to section 3.7.
+
+This fixes the message watermark, not ACL across RPCs. Gaining read permission
+does not replay history before the cursor; callers needing that history must
+Fetch the relevant Channel separately. System messages follow current read
+permissions in section 2.5 and recipient filtering. Therefore discovery cannot
+use `only_my_recipient=true`, and this procedure does not guarantee notification
+of removal from a private Channel.
 
 ## 4. ObjectStorageService
 
@@ -417,6 +498,13 @@ described in section 2.1.
 
 ## 5. ChannelService
 
+An ordinary Channel may contain at most 1024 distinct members, including its
+creator. CreateChannel returns `RESOURCE_EXHAUSTED` if deduplication and inclusion
+of the creator would exceed this total; AddMember returns the same status if a
+new member would exceed it. Such a rejection neither creates nor changes a
+Channel, creates no system message, allocates or consumes no UUID, and does not
+advance `max_seq`. Repeated additions of existing members follow section 5.4.
+
 ### 5.1 CreateChannel
 
 ```protobuf
@@ -430,9 +518,15 @@ rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
   is at most 4096 UTF-8 bytes.
 - The request parameter `members` contains at most 1024 entries, each greater than
   zero. After parameter validation, members are deduplicated and the creator is
-  added automatically, appearing only once. Names need not be globally unique.
+  added automatically, appearing only once. The result must satisfy the total
+  membership limit in [section 5's general rules](#5-channelservice). Names need not be globally unique.
 - `channel_id=0` is the system Channel and cannot be created through this RPC.
 - visibility must be public, protected, or private; unset means public.
+- Success writes one initialization system message in the new Channel,
+  containing the created Channel's attributes and complete initial membership.
+  Initial members, including the creator, do not each produce a separate join
+  event. See the [system protocol](SYSTEM_PROTOCOL.md) for the message schema
+  and section 2.8 for atomic commitment with Channel state.
 - Success returns the created ChannelInfo.
 
 ### 5.2 GetChannel
@@ -469,7 +563,12 @@ rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
   target principal must be greater than zero.
 
 Only the creator may add members. `channel_id=0` returns `PERMISSION_DENIED`, a
-missing Channel returns `NOT_FOUND`, and an existing member returns `ALREADY_EXISTS`.
+missing Channel returns `NOT_FOUND`, and an existing member returns `ALREADY_EXISTS`
+without a system message, even when the Channel has reached its total membership
+limit. New members must satisfy the total membership limit in
+[section 5's general rules](#5-channelservice). An actual
+addition writes one member-added system message in that Channel. See the
+[system protocol](SYSTEM_PROTOCOL.md) for the schema and section 2.8 for atomic commitment.
 
 ### 5.5 RemoveMember
 
@@ -482,10 +581,13 @@ rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 
 Only the creator may remove members. `channel_id=0` returns `PERMISSION_DENIED`,
 and a missing Channel returns `NOT_FOUND`. The creator cannot be removed. Removing a
-non-member is idempotent success. After a successful removal from a protected or
-private Channel, later writes by the removed principal return `PERMISSION_DENIED`.
-Removing a member from a public Channel does not change that principal's write
-permission.
+non-member is idempotent success without a system message. An actual removal
+writes one member-removed system message in that Channel. See the
+[system protocol](SYSTEM_PROTOCOL.md) for the schema and section 2.8 for atomic
+commitment. After a successful removal from a protected or private Channel, later
+publishes by the removed principal using an unconsumed UUID return `PERMISSION_DENIED`.
+Removing a member from a public Channel does not change that principal's write permission. System
+messages do not bypass read permissions; see section 2.5.
 
 ## 6. AdminService
 

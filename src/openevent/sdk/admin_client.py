@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import grpc
 
-from .client import _DEFAULT_CHANNEL_OPTIONS, _DEFAULT_RPC_TIMEOUT_MS, _validate_timeout_ms
+from .client import _DEFAULT_RPC_TIMEOUT_MS, _MESSAGE_SIZE_CHANNEL_OPTIONS, _validate_timeout_ms
 
 from .proto import admin_pb2, admin_pb2_grpc
 
@@ -15,7 +15,7 @@ class AdminClient:
     ):
         self._closed = True
         self.timeout_ms = timeout_ms
-        self.channel = grpc.insecure_channel(target, options=_DEFAULT_CHANNEL_OPTIONS)
+        self.channel = grpc.insecure_channel(target, options=_MESSAGE_SIZE_CHANNEL_OPTIONS)
         self._closed = False
         try:
             self.stub = admin_pb2_grpc.AdminServiceStub(self.channel)

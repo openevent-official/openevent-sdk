@@ -16,11 +16,15 @@ _DEFAULT_RPC_TIMEOUT_MS = 30_000.0
 _SUBSCRIBE_KEEPALIVE_TIME_MS = 30_000
 _SUBSCRIBE_KEEPALIVE_TIMEOUT_MS = 10_000
 _UUID_POOL_BATCH_SIZE = 1024
-_DEFAULT_CHANNEL_OPTIONS = (
+_MESSAGE_SIZE_CHANNEL_OPTIONS = (
     ("grpc.max_send_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
     ("grpc.max_receive_message_length", _DEFAULT_MAX_GRPC_MESSAGE_BYTES),
+)
+_DEFAULT_CHANNEL_OPTIONS = _MESSAGE_SIZE_CHANNEL_OPTIONS + (
     ("grpc.keepalive_time_ms", _SUBSCRIBE_KEEPALIVE_TIME_MS),
     ("grpc.keepalive_timeout_ms", _SUBSCRIBE_KEEPALIVE_TIMEOUT_MS),
+    # Recent gRPC transports also use a separate HTTP/2 PING timeout.
+    ("grpc.http2.ping_timeout_ms", _SUBSCRIBE_KEEPALIVE_TIMEOUT_MS),
     ("grpc.keepalive_permit_without_calls", 1),
     ("grpc.http2.max_pings_without_data", 0),
 )

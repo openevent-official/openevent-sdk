@@ -2,8 +2,8 @@
 
 [English version](API.md)
 
-> 版本: 0.11.1
-> 日期: 2026-09-29
+> 版本: 0.12.0
+> 日期: 2026-10-13
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
 [`proto/admin.proto`](../proto/admin.proto) 的公开 API 行为。
@@ -11,16 +11,16 @@
 ## 1. 基础约定
 
 - 所有接口通过 `gRPC + Protocol Buffers` 提供。
-- 有效初始化的服务端始终包含永久保留的系统初始化消息 `seq=0`；业务消息从 `seq=1` 开始。
-- 每条业务 `EventMessage` 包含 `ts_ms`，表示服务端收到发布请求时的 Unix 毫秒时间戳；seq 0 的值是
-  `system.v1` 定义的初始化事件时间。
-- 每条业务 `EventMessage` 都包含由 `AllocateUuids` 分配的非 0 `uuid`。系统初始化消息是唯一例外，使用
-  `uuid=0` 和 `principal=0`。
-- 业务 `payload` 作为不透明 bytes 保存。服务端生成的 seq=0 系统 payload
-  遵循独立的 `system.v1` 协议。
+- 有效初始化的服务端始终包含永久保留的全局初始化消息 `seq=0`；此后的业务消息和 Channel 系统消息
+  共用从 `seq=1` 开始的全局消息序列。
+- 每条业务 `EventMessage` 的 `ts_ms` 是服务端收到发布请求时的 Unix 毫秒时间戳。
+- 业务消息使用由 `AllocateUuids` 分配的非 0 `uuid`；Channel 系统消息由服务端从同一分配器取得非 0 UUID。
+  只有全局初始化消息使用 `uuid=0`。
+- 业务 `payload` 作为不透明 bytes 保存。所有服务端系统消息的识别、字段和 payload schema 统一见
+  [系统协议](SYSTEM_PROTOCOL_cn.md)；读取方先区分系统消息，再按 Channel 的业务协议解析业务消息。
 - 业务 principal 必须大于 0。`principal=0` 保留给服务端生成的系统行为；在业务及 token 管理请求的 principal、
   Channel creator/member、recipient 或对象创建者位置使用 0 时返回 `INVALID_ARGUMENT`。
-- OpenEvent 永久保留已提交消息、Channel metadata 和不可变对象。
+- OpenEvent 在当前数据历史中永久保留已提交消息、Channel metadata 和不可变对象；数据历史的边界见 1.2 节。
 
 ### 1.1 服务划分
 
@@ -30,6 +30,18 @@
 | `ObjectStorageService` | 不可变对象写入、metadata 查询和部分数据读取 |
 | `ChannelService` | Channel 创建、查询、列表、成员管理 |
 | `AdminService` | token 管理和全部消息的管理查询 |
+
+### 1.2 数据历史与备份恢复
+
+消息 `seq`、UUID、Channel ID 和 object ID 的单调递增与不复用保证，以及消息和对象的永久保留、
+ObjectKey 的永久有效性，都以当前数据历史为作用域。复用完整数据目录正常重启或崩溃恢复，不改变这条历史。
+
+恢复旧备份则视为切换到另一条数据历史，而不是继续恢复前的历史。恢复后的状态和分配水位以备份为准；
+原历史在备份之后的修改不在恢复后的历史中，相应的序号和 ID 值可能再次被分配。备份中恢复的消息、
+Channel、对象、token 和 ObjectKey 仍按恢复后的状态和本文契约可用；恢复操作不会额外撤销这些凭据。
+
+不能把恢复前历史中的读取进度、订阅游标或未完成的 UUID 重试状态直接接到恢复后的历史上；资源引用
+以恢复后的数据历史为准。当前接口不携带数据历史标识，不会自动识别或转换跨历史的游标、重试状态和引用。
 
 ## 2. 通用语义
 
@@ -42,7 +54,7 @@
 | `NOT_FOUND` | Channel 不存在，或对象 capability 不存在/无效 |
 | `ALREADY_EXISTS` | 资源已存在，例如重复添加成员或 UUID 已被消息使用 |
 | `INVALID_ARGUMENT` | 字段缺失、值非法，或 recipients 不满足成员约束 |
-| `RESOURCE_EXHAUSTED` | payload 超过上限，或对象文件存储空间/quota/inode 不足 |
+| `RESOURCE_EXHAUSTED` | payload 或 Channel 成员总数超过上限，或对象文件存储空间/quota/inode 不足 |
 | `OUT_OF_RANGE` | ReadObject offset 大于对象大小，或 Subscribe 起点超过 `max_seq + 1` |
 | `ABORTED` | `Publish.req.seq != max_seq + 1` |
 | `CANCELLED` | 调用被取消；写入结果可能不确定 |
@@ -62,24 +74,29 @@
 ### 2.2 消息序列
 
 - `EventMessage.seq` 是全局单调递增消息序号。
-- `seq=0` 是永久保留的系统初始化消息。`max_seq=0` 表示当前只有该消息。
+- `seq=0` 是永久保留的全局初始化消息。`max_seq=0` 表示当前只有该消息。
 - 已提交 seq 不复用。
-- 业务消息 seq 按 `max_seq + 1` 递增；读取方按服务端返回的游标继续扫描。
+- 业务消息和 Channel 系统消息的 seq 都按 `max_seq + 1` 递增；读取方按服务端返回的游标继续扫描。
+  创建 Channel 或实际修改成员也会推进 `max_seq`，并可能使并发 Publish 的 seq CAS 返回 `ABORTED`。
 - `GetStatus`、`Fetch` 和 `Subscribe` 都使用同一消息序列。
 
 ### 2.3 Payload
 
 - `Publish` 与 `PublishAutoSeq` 都接受 `payload`，且 payload 可以为空。
-- 写入大小上限由部署配置 `max_payload_bytes` 决定，只用于发布请求的 payload 校验。
+- 写入大小上限由部署配置 `max_payload_bytes` 决定，只用于业务发布请求的 payload 校验，不限制服务端
+  生成的系统消息。
 - 超限返回 `RESOURCE_EXHAUSTED`，不产生新消息。
 - Fetch、Subscribe 和管理端 ListMessages 始终返回历史消息的完整 payload，包括下调写入上限后。
   分页预算决定返回的页边界。
 
 ### 2.4 消息 UUID
 
-- UUID 0 保留给系统初始化消息。
+- UUID 0 保留给全局初始化消息。
 - 每个 Publish 和 PublishAutoSeq 请求都必须携带一个由 AllocateUuids 返回的非 0 UUID。
-- 初始化消息参与普通 UUID 查询，`GetSeqByUuid(0)` 返回 `seq=0`；客户端不能分配或发布
+- Channel 系统消息与 AllocateUuids 共用 UUID 分配器；服务端内部取号并在对应 Channel 修改的同一次
+  提交中消费该 UUID。客户端分配的 UUID 不会被系统消息占用。
+- 未提交或未实际改变状态的 Channel 修改操作不分配或消费 UUID，也不推进消息序号；其他并发操作仍可推进水位。
+- 全局初始化消息参与普通 UUID 查询，`GetSeqByUuid(0)` 返回 `seq=0`；客户端不能分配或发布
   UUID 0。业务发布使用未由服务端分配的 UUID 时返回 `INVALID_ARGUMENT`，已被 committed 消息消费时返回
   `ALREADY_EXISTS`。
 - 认证成功后，已被消费的 UUID 必须先于 payload、ObjectKey、Channel、ACL 和 Publish seq-CAS 校验返回
@@ -96,7 +113,8 @@
 | `VISIBILITY_PRIVATE` | Channel 成员 | Channel 成员 |
 
 系统 Channel `channel_id=0` 对所有已认证调用方只读；固定字段、列表归属和初始化消息定义见
-[`SYSTEM_PROTOCOL_cn.md`](SYSTEM_PROTOCOL_cn.md)。
+[`SYSTEM_PROTOCOL_cn.md`](SYSTEM_PROTOCOL_cn.md)。普通 Channel 中的系统消息沿用该 Channel 的当前读取
+权限，不提供特殊投递权限；被移出 private Channel 的调用方不保证能读到移除事件。
 
 ### 2.6 Recipients
 
@@ -123,12 +141,15 @@
   非流式读请求在自己的顺序位置取得一致 snapshot。Subscribe 不属于该全局顺序。
 - 发布时 `principal + token` 组合和 Channel 写权限按该发布提交前最新的 committed 状态判断；权限校验与消息提交
   之间不会插入另一个 token 或 Channel 修改。
-- protected/private Channel 的 RemoveMember 先成功时，被移除成员排在其后的发布返回
+- protected/private Channel 的 RemoveMember 先成功时，被移除成员排在其后使用未消费 UUID 的发布返回
   `PERMISSION_DENIED`；public Channel 不依赖成员列表，移除成员不改变其写权限。DeleteToken 先成功时，
   使用被删除组合的后续发布返回 `UNAUTHENTICATED`；其他 principal 下相同 token 字符串不受影响。
   发布先成功时消息保持已提交。
 - WriteObject 处理期间可以与其他操作交错；只有完整持久提交的对象才对读取和消息引用可见，
   对象的完整提交是该写入的顺序点。
+- CreateChannel、实际添加成员和实际移除成员，各自与一条对应的 Channel 系统消息原子提交。Channel
+  metadata、系统消息、UUID 分配与消费、`max_seq` 要么全部提交，要么全部不提交。初始化消息是新 Channel
+  的第一条消息，先于该 Channel 的任何业务消息或成员变更消息。
 - 写请求只在服务端完成同步持久化后返回成功。成功响应表示修改已经提交并满足服务端持久性承诺。
 - 如果调用方在写 RPC 成功返回后才发起非流式读 RPC，该读必须观察到该写的完整结果。相互重叠
   的修改和非流式读取按服务端全局顺序观察提交前或提交后的完整状态，不能观察部分提交。
@@ -166,10 +187,10 @@ rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 
 - 请求必须提供有效的 `principal` 和 `token`；`principal=0` 返回 `INVALID_ARGUMENT`，认证失败返回
   `UNAUTHENTICATED`。
-- 响应仅包含 `max_seq`：最大已提交消息 seq；只有系统初始化消息时为 0。
+- 响应仅包含 `max_seq`：最大已提交消息 seq；只有全局初始化消息时为 0。
 
-客户端可以把 `max_seq+1` 作为下一次 Publish 的候选 seq。并发发布先占用该值时，Publish 返回
-`ABORTED`。
+客户端可以把 `max_seq+1` 作为下一次 Publish 的候选 seq。并发业务发布或 Channel 系统消息先占用该值时，
+Publish 返回 `ABORTED`。
 
 ### 3.2 AllocateUuids
 
@@ -179,7 +200,7 @@ rpc AllocateUuids(AllocateUuidsRequest) returns (AllocateUuidsResponse);
 
 请求只包含必须位于 `1..1024` 的 `count`。响应恰好包含 count 个全局单调递增且连续的 UUID，按递增顺序
 返回。分配不认证，也不创建消息。成功调用会持久化推进分配水位；即使没有消息消费，已分配 UUID 也不会重复使用。仅分配不会使 UUID
-可被 GetSeqByUuid 查到。
+可被 GetSeqByUuid 查到。Channel 系统消息也会推进同一分配水位，因此相邻两次调用之间的 UUID 可以不连续。
 
 ### 3.3 GetSeqByUuid
 
@@ -187,7 +208,7 @@ rpc AllocateUuids(AllocateUuidsRequest) returns (AllocateUuidsResponse);
 rpc GetSeqByUuid(GetSeqByUuidRequest) returns (GetSeqByUuidResponse);
 ```
 
-请求只包含 `uuid`，不携带 `principal` 或 `token`。该不认证读取不改变分配或消息状态。UUID 为 0 时，系统初始化消息返回
+请求只包含 `uuid`，不携带 `principal` 或 `token`。该不认证读取不改变分配或消息状态。UUID 为 0 时，全局初始化消息返回
 `seq=0`。其他 UUID 除非已被 committed 消息消费，否则返回 `NOT_FOUND`；未分配 UUID 和已分配但未使用 UUID 均属于此情况。
 成功时 `seq` 是消费该 UUID 的 committed 消息序号。
 
@@ -280,9 +301,10 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 - 校验通过后，被 Channel ACL、channels 或 recipient 过滤的记录不产生响应，但服务端扫描会消费这些记录并
   继续向后处理。订阅运行期间如果显式 Channel 的读取权限失效，后续批次返回 `PERMISSION_DENIED` 并结束
   stream。
-- 未指定 channels 时，权限变化只使后续批次过滤已经不可读的 private Channel，不结束整个订阅。
-  protected Channel 移除成员不改变读取权限。删除订阅使用的 `principal + token` 组合后，下一批返回
-  `UNAUTHENTICATED` 并结束 stream。
+- 未指定 channels 时，后续批次自动包含新创建且可读的 Channel，以及新获得读取权限的 Channel，无需重建
+  订阅；已经被过滤并消费的旧消息不会因此回放。权限变化只使后续批次过滤已经不可读的 private Channel，
+  不结束整个订阅。protected Channel 移除成员不改变读取权限。删除订阅使用的 `principal + token` 组合后，
+  下一批返回 `UNAUTHENTICATED` 并结束 stream。
 
 | `from_seq` | 行为 |
 |------------|------|
@@ -302,11 +324,34 @@ rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 
 Subscribe stream 持续保持打开，直到发生中断。业务 gRPC 端口在传输层 30 秒没有活动后发送
 一次 HTTP/2 PING；10 秒内收不到确认就关闭连接。服务端只接受间隔不少于 20 秒的客户端 PING。Python
-高层 client 每 30 秒发送一次客户端 PING，并且不为 Subscribe 设置 deadline；使用其他 gRPC client 或
-生成式 stub 的调用方必须为自己的 channel 配置与服务端兼容的传输层保活策略。
+高层 client 每 30 秒发送一次客户端 PING，10 秒内收不到确认就关闭本端连接，并且不为 Subscribe 设置
+deadline；使用其他 gRPC client 或生成式 stub 的调用方必须为自己的 channel 配置与服务端兼容的传输层保活策略。
+
+上述时间用于检测失联连接，不是 RPC 的执行时限。客户端决定单次 RPC 的 deadline；Python 高层 client
+的 `timeout_ms` 只用于非流式 RPC，不改变服务端的保活时间。连接失效时，双方各自检测并释放本端连接；
+网络中断可能阻止客户端的取消通知到达服务端。
+只要连接正常并能回应 PING，没有业务消息也不会使订阅超时。
 
 服务端开始正常或致命关闭时，会主动结束已经建立的 Subscribe stream；客户端应按其他 stream 中断
 处理，记录最后已处理的 seq，并按上述恢复规则继续订阅或 Fetch。
+
+### 3.8 通过消息发现 Channel
+
+调用方可以在恢复消息历史的同时，根据 [Channel 系统消息](SYSTEM_PROTOCOL_cn.md) 发现 Channel，
+无需先调用或定时调用 ListChannels。初始化和持续订阅使用同一套消息处理逻辑：
+
+1. 调用 GetStatus，记录固定水位 `H=max_seq`。
+2. 从 `from_seq=0` 开始 Fetch，设置 `channels=[]`、`only_my_recipient=false`。按 `next_seq` 翻页，
+   只处理 `seq<=H` 的消息；直到 `next_seq>H` 才完成历史读取，不能因短页或空页提前结束。
+3. 遇到系统消息时按系统协议处理 Channel 信息；是否把可读 Channel 纳入自己的业务列表，由调用方根据
+   协议和成员信息决定。可读不等于已加入。如果只收到成员加入事件而缺少 Channel 属性，可按该
+   `channel_id` 调用一次 GetChannel，无需为此重读历史或扫描列表。
+4. 完成历史恢复后，以 `from_seq=H+1`、`channels=[]`、`only_my_recipient=false` 建立 Subscribe。
+   恢复期间新提交的消息从这里继续读取；断线恢复遵循 3.7 节。
+
+该流程固定消息水位，不固定跨 RPC 的 ACL。新增读取权限不会自动补发游标之前的历史；需要这些历史时，
+调用方对相应 Channel 另行 Fetch。系统消息遵循 2.5 节的当前读取权限，也受 recipient 过滤影响，
+因此不能用 `only_my_recipient=true` 发现 Channel，也不能靠此流程保证收到被移出 private Channel 的通知。
 
 ## 4. ObjectStorageService
 
@@ -361,6 +406,10 @@ rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
 
 ## 5. ChannelService
 
+普通 Channel 去重后的成员总数最多为 1024，包含创建者。CreateChannel 在去重并加入创建者后、
+AddMember 在新增成员后，若总数会超过此上限，则返回 `RESOURCE_EXHAUSTED`。这种拒绝不创建或修改
+Channel，不产生系统消息，不分配或消费 UUID，也不推进 `max_seq`。重复添加已有成员的结果以 5.4 节为准。
+
 ### 5.1 CreateChannel
 
 ```protobuf
@@ -371,9 +420,12 @@ rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
 - `name` 必填，UTF-8 编码最多 255 bytes；`protocol` 可以为空，非空时最多 255 bytes；
   `description` 可以为空，最多 4096 UTF-8 bytes。
 - 请求参数 `members` 最多 1024 项，每个 principal 必须大于 0。参数检查后对成员去重，并自动加入创建者，
-  创建者只保留一份。name 不要求全局唯一。
+  创建者只保留一份；结果须满足[第 5 节总则](#5-channelservice)的成员总数上限。name 不要求全局唯一。
 - `channel_id=0` 为系统 Channel，不能通过此接口创建。
 - visibility 必须是 public、protected 或 private；未设置时默认为 public。
+- 成功时在新 Channel 内写入一条初始化系统消息，包含创建后的 Channel 属性和完整初始成员列表；
+  初始成员（含创建者）不再逐个产生加入事件。消息 schema 见[系统协议](SYSTEM_PROTOCOL_cn.md)，
+  与 Channel 状态一起提交的规则见 2.8 节。
 - 成功响应返回创建后的 ChannelInfo。
 
 ### 5.2 GetChannel
@@ -411,7 +463,10 @@ rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
 - 操作者必须是 Channel 创建者。
 - `channel_id=0` 返回 `PERMISSION_DENIED`。
 - Channel 不存在返回 `NOT_FOUND`。
-- 目标已是成员时返回 `ALREADY_EXISTS`。
+- 目标已是成员时返回 `ALREADY_EXISTS`，即使 Channel 已达到成员总数上限也一样，不产生系统消息。
+- 新增成员须满足[第 5 节总则](#5-channelservice)的成员总数上限。
+- 实际添加成员时，在该 Channel 内写入一条成员加入系统消息；schema 见[系统协议](SYSTEM_PROTOCOL_cn.md)，
+  原子提交规则见 2.8 节。
 
 ### 5.5 RemoveMember
 
@@ -424,8 +479,11 @@ rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 - `channel_id=0` 返回 `PERMISSION_DENIED`。
 - Channel 不存在返回 `NOT_FOUND`。
 - 不允许移除创建者本人。
-- 移除非成员目标是幂等成功。protected/private Channel 移除成员成功后，该成员的后续写入返回
-  `PERMISSION_DENIED`；public Channel 的写权限不受成员列表影响。
+- 移除非成员目标是幂等成功，不产生系统消息。
+- 实际移除成员时，在该 Channel 内写入一条成员移除系统消息；schema 见[系统协议](SYSTEM_PROTOCOL_cn.md)，
+  原子提交规则见 2.8 节。
+- protected/private Channel 移除成员成功后，该成员后续使用未消费 UUID 的发布返回 `PERMISSION_DENIED`；
+  public Channel 的写权限不受成员列表影响。系统消息不绕过读取权限，见 2.5 节。
 
 ## 6. AdminService
 

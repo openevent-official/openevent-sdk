@@ -231,7 +231,10 @@ def test_client_context_manager_closes_owned_channel(monkeypatch, client_type) -
     assert channel.close_calls == 1
 
 
-def test_open_event_client_enables_subscribe_keepalive_on_owned_channel(monkeypatch) -> None:
+@pytest.mark.parametrize("client_type", [OpenEventClient, AdminClient])
+def test_client_channel_options_only_enable_keepalive_for_subscriptions(
+    monkeypatch, client_type
+) -> None:
     channel = _CloseTrackingChannel()
     captured_options = []
 
@@ -243,11 +246,21 @@ def test_open_event_client_enables_subscribe_keepalive_on_owned_channel(monkeypa
     monkeypatch.setattr(client_module.grpc, "insecure_channel", create_channel)
     _patch_stub_constructors(monkeypatch)
 
-    client = OpenEventClient("unused")
+    client = client_type("unused")
     client.close()
+
+    message_options = [
+        ("grpc.max_send_message_length", 64 * 1024 * 1024),
+        ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+    ]
+    assert all(option in captured_options for option in message_options)
+    if client_type is AdminClient:
+        assert captured_options == message_options
+        return
 
     assert ("grpc.keepalive_time_ms", 30_000) in captured_options
     assert ("grpc.keepalive_timeout_ms", 10_000) in captured_options
+    assert ("grpc.http2.ping_timeout_ms", 10_000) in captured_options
     assert ("grpc.keepalive_permit_without_calls", 1) in captured_options
     assert ("grpc.http2.max_pings_without_data", 0) in captured_options
 
@@ -326,6 +339,39 @@ def test_subscribe_preserves_increasing_sequences_and_forwards_cancellation() ->
     assert next(stream).message.seq == 0
     assert stream.cancel()
     assert stub.stream.cancelled
+
+
+def test_fetch_and_subscribe_return_mixed_system_and_business_messages_unchanged() -> None:
+    messages = [
+        openevent_pb2.EventMessage(
+            seq=11, channel_id=7, principal=0, uuid=21,
+            payload=(b'{"kind":"system.channel_initialized","data":{"schema_version":1,'
+                     b'"name":"chat","protocol":"opaque.v1","description":"",'
+                     b'"visibility":"private","creator":9,"members":[9]}}'),
+        ),
+        openevent_pb2.EventMessage(seq=12, channel_id=7, principal=9, uuid=22, payload=b"\xffopaque"),
+        openevent_pb2.EventMessage(
+            seq=13, channel_id=7, principal=0, uuid=23,
+            payload=b'{"kind":"system.member_added","data":{"schema_version":1,"member":10}}',
+        ),
+    ]
+    fetched = openevent_pb2.FetchResponse(messages=messages, next_seq=14, last_seq=13)
+    subscribed = [openevent_pb2.SubscribeResponse(message=message) for message in messages]
+
+    class Stub:
+        def Fetch(self, request, timeout=None):
+            return fetched
+
+        def Subscribe(self, request, timeout=None):
+            return iter(subscribed)
+
+    client = OpenEventClient.__new__(OpenEventClient)
+    client.event_stub = Stub()
+    client.timeout_ms = 1_000
+    assert client.fetch(9, "token", 11, 10, channels=[7]) is fetched
+    returned = list(client.subscribe(9, "token", from_seq=11, channels=[7]))
+    assert all(actual is expected for actual, expected in zip(returned, subscribed))
+    assert [response.message for response in returned] == messages
 
 
 @pytest.mark.parametrize("previous, received", [(0, 0), (2, 2), (2, 1)])
