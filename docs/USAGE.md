@@ -185,6 +185,26 @@ Object limits, reference authorization, and errors are defined by the
 [object API](API.md#4-objectstorageservice)
 and [ObjectKey rules](API.md#27-object-capabilities-and-message-references).
 
+`batch_get_object_metadata(object_keys: Iterable[ObjectKey])` queries an existing
+list of object references in one call. For example, `message` is an already read
+message containing object references:
+
+```python
+keys = list(message.object_keys)
+batch = client.batch_get_object_metadata(keys)
+for key, metadata in zip(keys, batch.metadata):
+    print(key.object_id, metadata.name, metadata.nbytes)
+```
+
+The method makes one RPC, uses `timeout_ms`, and returns the original
+`BatchGetObjectMetadataResponse`. Its `metadata` entries are `ObjectMetadata`
+messages and correspond to `keys` by position, including duplicates. If any entry
+fails, the whole call raises `grpc.RpcError` without returning partial results.
+The SDK does not split batches,
+deduplicate, cache, or retry automatically. See the
+[batch metadata API](API.md#44-batchgetobjectmetadata) for count limits, parameters,
+and errors.
+
 ## Fetch Messages
 
 ```python

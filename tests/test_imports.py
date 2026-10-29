@@ -4,6 +4,7 @@ from collections import deque
 from threading import Event, Lock, Thread
 
 import pytest
+from google.protobuf import descriptor_pb2
 
 from openevent.sdk import AdminClient, OpenEventClient
 from openevent.sdk import admin_client as admin_client_module
@@ -553,8 +554,33 @@ def test_object_protocol_descriptors_and_reference_order() -> None:
     assert list(object_service.methods_by_name) == [
         "WriteObject",
         "GetObjectMetadata",
+        "BatchGetObjectMetadata",
         "ReadObject",
     ]
+    batch_metadata = object_service.methods_by_name["BatchGetObjectMetadata"]
+    assert batch_metadata.input_type.full_name == "openevent.BatchGetObjectMetadataRequest"
+    assert batch_metadata.output_type.full_name == "openevent.BatchGetObjectMetadataResponse"
+    assert not batch_metadata.client_streaming and not batch_metadata.server_streaming
+    batch_request = openevent_pb2.BatchGetObjectMetadataRequest.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in batch_request.items()} == {"object_keys": 1}
+    assert batch_request["object_keys"].message_type.full_name == "openevent.ObjectKey"
+    batch_response = openevent_pb2.BatchGetObjectMetadataResponse.DESCRIPTOR.fields_by_name
+    assert {name: field.number for name, field in batch_response.items()} == {"metadata": 1}
+    assert batch_response["metadata"].message_type.full_name == "openevent.ObjectMetadata"
+    object_metadata = openevent_pb2.ObjectMetadata.DESCRIPTOR.fields_by_name
+    assert {name: (field.number, field.type) for name, field in object_metadata.items()} == {
+        "name": (1, descriptor_pb2.FieldDescriptorProto.TYPE_STRING),
+        "type": (2, descriptor_pb2.FieldDescriptorProto.TYPE_STRING),
+        "description": (3, descriptor_pb2.FieldDescriptorProto.TYPE_STRING),
+        "nbytes": (4, descriptor_pb2.FieldDescriptorProto.TYPE_UINT64),
+    }
+    for message_type in (
+        openevent_pb2.BatchGetObjectMetadataRequest,
+        openevent_pb2.BatchGetObjectMetadataResponse,
+    ):
+        descriptor = descriptor_pb2.DescriptorProto()
+        message_type.DESCRIPTOR.CopyToProto(descriptor)
+        assert descriptor.field[0].label == descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED
 
     object_key = openevent_pb2.ObjectKey.DESCRIPTOR.fields_by_name
     assert object_key["object_id"].number == 1
@@ -699,6 +725,73 @@ def test_high_level_object_and_reference_requests_are_complete() -> None:
     assert object_calls[2][1].nbytes == 2
     assert metadata.nbytes == 4
     assert data.data == b"data"
+
+
+def test_batch_get_object_metadata_consumes_iterable_once_and_preserves_response() -> None:
+    first = openevent_pb2.ObjectKey(object_id=2, object_token="first")
+    second = openevent_pb2.ObjectKey(object_id=1, object_token="second")
+    response = openevent_pb2.BatchGetObjectMetadataResponse(metadata=[
+        openevent_pb2.ObjectMetadata(name="first", nbytes=3),
+        openevent_pb2.ObjectMetadata(name="second", nbytes=7),
+        openevent_pb2.ObjectMetadata(name="first", nbytes=3),
+    ])
+    calls = []
+
+    class OnceIterable:
+        def __init__(self):
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            assert self.iterations == 1
+            yield from (first, second, first)
+
+    class Stub:
+        def BatchGetObjectMetadata(self, request, timeout):
+            calls.append((request, timeout))
+            return response
+
+    client = OpenEventClient.__new__(OpenEventClient)
+    client.object_stub = Stub()
+    client.timeout_ms = 1_250
+    keys = OnceIterable()
+    assert client.batch_get_object_metadata(keys) is response
+    assert keys.iterations == 1
+    assert len(calls) == 1
+    assert calls[0][1] == 1.25
+    assert [(key.object_id, key.object_token) for key in calls[0][0].object_keys] == [
+        (2, "first"), (1, "second"), (2, "first"),
+    ]
+
+
+@pytest.mark.parametrize("code", [
+    client_module.grpc.StatusCode.INVALID_ARGUMENT,
+    client_module.grpc.StatusCode.NOT_FOUND,
+    client_module.grpc.StatusCode.UNAVAILABLE,
+])
+def test_batch_get_object_metadata_preserves_rpc_errors_without_retry(code) -> None:
+    class Rejected(client_module.grpc.RpcError):
+        def code(self):
+            return code
+
+    error = Rejected()
+    calls = []
+
+    class Stub:
+        def BatchGetObjectMetadata(self, request, timeout):
+            calls.append((request, timeout))
+            raise error
+
+    client = OpenEventClient.__new__(OpenEventClient)
+    client.object_stub = Stub()
+    client.timeout_ms = 500
+    key = openevent_pb2.ObjectKey(object_id=1, object_token="object-token")
+    with pytest.raises(client_module.grpc.RpcError) as rejected:
+        client.batch_get_object_metadata([key])
+    assert rejected.value is error
+    assert rejected.value.code() == code
+    assert len(calls) == 1
+    assert calls[0][1] == 0.5
 
 
 @pytest.mark.parametrize("client_type,method,stub_name,rpc,args,kwargs,response_type", [

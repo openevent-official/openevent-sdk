@@ -169,6 +169,21 @@ chunk = client.read_object(
 对象限制、引用授权和错误规则见
 [对象 API](API_cn.md#4-objectstorageservice) 和 [ObjectKey 规则](API_cn.md#27-对象-capability-与消息引用)。
 
+`batch_get_object_metadata(object_keys: Iterable[ObjectKey])` 可一次查询已有的对象引用列表。
+例如，`message` 是一条已经读取且包含对象引用的消息：
+
+```python
+keys = list(message.object_keys)
+batch = client.batch_get_object_metadata(keys)
+for key, metadata in zip(keys, batch.metadata):
+    print(key.object_id, metadata.name, metadata.nbytes)
+```
+
+方法只发起一次 RPC，沿用 `timeout_ms`，返回原始 `BatchGetObjectMetadataResponse`。
+`metadata` 的元素类型为 `ObjectMetadata`，按位置与 `keys` 对应，重复项也保留；
+任一项失败时整批抛出 `grpc.RpcError`，不返回部分结果。
+SDK 不自动拆批、去重、缓存或重试；数量、参数和错误规则见 [批量 metadata API](API_cn.md#44-batchgetobjectmetadata)。
+
 ## 拉取消息
 
 ```python

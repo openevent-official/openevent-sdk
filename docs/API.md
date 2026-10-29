@@ -2,8 +2,8 @@
 
 [中文版](API_cn.md)
 
-> Version: 0.12.0
-> Date: 2026-10-13
+> Version: 0.13.0
+> Date: 2026-10-28
 
 This document defines the public behavior of the business protocol
 [`proto/openevent.proto`](../proto/openevent.proto) and management protocol
@@ -36,7 +36,7 @@ This document defines the public behavior of the business protocol
 | Service | Responsibility |
 |---------|----------------|
 | `EventService` | Status queries, publishing, batch fetch, and streaming subscription |
-| `ObjectStorageService` | Immutable object writes, metadata queries, and partial data reads |
+| `ObjectStorageService` | Immutable object writes, single/batch metadata queries, and partial data reads |
 | `ChannelService` | Channel creation, queries, listing, and member management |
 | `AdminService` | Token management and administrative message queries |
 
@@ -495,6 +495,34 @@ the same `NOT_FOUND` result. Tokens are treated as opaque strings.
 ReadObject returns `DATA_LOSS` if committed data is missing, not a regular file,
 or has the wrong size, and the server exits as
 described in section 2.1.
+
+### 4.4 BatchGetObjectMetadata
+
+```protobuf
+rpc BatchGetObjectMetadata(BatchGetObjectMetadataRequest) returns (BatchGetObjectMetadataResponse);
+```
+
+Read metadata for multiple committed objects in one request without reading object
+data. Authorization uses only the ObjectKey capabilities in `object_keys`; no
+ordinary `principal + token` is required.
+
+- `object_keys` must contain `1..1024` items. The server first checks the size of
+  the entire list and that every item has a nonzero `object_id` and a nonempty
+  `object_token`. Any violation returns `INVALID_ARGUMENT`.
+- After input validation, the entire batch uses one database snapshot at one
+  linearization point to read committed metadata and check each capability. A
+  missing or uncommitted object or a token mismatch returns `NOT_FOUND`, as with
+  a single-object query.
+- On success, `metadata` has exactly the same length and order as the request;
+  each item is an independent `ObjectMetadata` message with the same fields as
+  the single-object response in section 4.2. Duplicate ObjectKeys are preserved.
+  Different tokens for the same `object_id` are each checked.
+- If any item fails, the entire RPC fails without partial results. After input
+  validation, objects are queried in input order and the first error encountered
+  is returned. Storage failures still follow section 2.1.
+
+The fixed batch limit bounds the work and response size of one query. It does not
+change the metadata limits for individual objects.
 
 ## 5. ChannelService
 

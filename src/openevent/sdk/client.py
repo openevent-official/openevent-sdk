@@ -296,6 +296,12 @@ class OpenEventClient:
             timeout=self._rpc_timeout_seconds,
         )
 
+    def batch_get_object_metadata(self, object_keys: Iterable[openevent_pb2.ObjectKey]):
+        return self.object_stub.BatchGetObjectMetadata(
+            openevent_pb2.BatchGetObjectMetadataRequest(object_keys=list(object_keys)),
+            timeout=self._rpc_timeout_seconds,
+        )
+
     def read_object(self, object_id: int, object_token: str, offset: int, nbytes: int):
         return self.object_stub.ReadObject(
             openevent_pb2.ReadObjectRequest(

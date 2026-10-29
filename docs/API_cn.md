@@ -2,8 +2,8 @@
 
 [English version](API.md)
 
-> 版本: 0.12.0
-> 日期: 2026-10-13
+> 版本: 0.13.0
+> 日期: 2026-10-28
 
 本文档描述业务协议 [`proto/openevent.proto`](../proto/openevent.proto) 和管理协议
 [`proto/admin.proto`](../proto/admin.proto) 的公开 API 行为。
@@ -27,7 +27,7 @@
 | Service | 职责 |
 |---------|------|
 | `EventService` | 状态查询、消息发布、批量拉取、流式订阅 |
-| `ObjectStorageService` | 不可变对象写入、metadata 查询和部分数据读取 |
+| `ObjectStorageService` | 不可变对象写入、单个/批量 metadata 查询和部分数据读取 |
 | `ChannelService` | Channel 创建、查询、列表、成员管理 |
 | `AdminService` | token 管理和全部消息的管理查询 |
 
@@ -403,6 +403,26 @@ rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
 对 GetObjectMetadata 和 ReadObject，`object_id=0` 或对象 token 为空返回 `INVALID_ARGUMENT`；对象
 不存在/未提交和所有 token 不匹配统一返回 `NOT_FOUND`。token 作为不透明字符串处理。
 若 committed data 缺失、不是普通文件或大小错误，ReadObject 返回 `DATA_LOSS`，并按 2.1 节退出。
+
+### 4.4 BatchGetObjectMetadata
+
+```protobuf
+rpc BatchGetObjectMetadata(BatchGetObjectMetadataRequest) returns (BatchGetObjectMetadataResponse);
+```
+
+一次请求读取多个已提交对象的 metadata，不读取对象 data。请求只使用 `object_keys` 中的
+ObjectKey capability，不要求普通 `principal + token`。
+
+- `object_keys` 必须包含 `1..1024` 项。服务端先检查整个列表的数量，以及每一项的 `object_id`
+  非 0、`object_token` 非空；任一条件不满足，返回 `INVALID_ARGUMENT`。
+- 通过参数检查后，整批查询使用同一个线性化位置的数据库 snapshot，逐项读取已提交 metadata 并校验
+  capability。对象不存在、未提交或 token 不匹配均返回 `NOT_FOUND`，与单个查询相同。
+- 成功时 `metadata` 与请求的数量、顺序严格对应；每项为独立的 `ObjectMetadata` 消息类型，字段与
+  4.2 节的单查响应相同。重复 ObjectKey 不去重，同一 `object_id` 的不同 token 也分别校验。
+- 任一项失败，整个 RPC 失败，不返回部分结果。参数检查通过后的对象查询按输入顺序执行，返回遇到的
+  第一个错误；存储故障仍按 2.1 节处理。
+
+固定批量上限约束单次查询的工作量和响应大小；它不改变单个对象的 metadata 限制。
 
 ## 5. ChannelService
 

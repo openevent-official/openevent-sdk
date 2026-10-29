@@ -1198,6 +1198,98 @@ def test_object_write_metadata_and_partial_read(admin: AdminClient, client: Open
     assert next_object.object_id > written.object_id
 
 
+def test_batch_object_metadata_preserves_order_duplicates_and_fields(
+    admin: AdminClient, client: OpenEventClient
+) -> None:
+    principal = 1802
+    token = _token(admin, principal)
+    entries = [
+        ("附件.bin", "application/octet-stream", "说明：原样保留\x00结束", b"\x00\xffpayload"),
+        ("second.txt", "text/plain", "", "你好".encode("utf-8")),
+    ]
+    keys = []
+    expected = []
+    for name, content_type, description, data in entries:
+        written = client.write_object(
+            principal=principal, token=token, name=name, type=content_type,
+            description=description, data=data,
+        )
+        keys.append(openevent_pb2.ObjectKey(
+            object_id=written.object_id, object_token=written.object_token,
+        ))
+        expected.append(openevent_pb2.ObjectMetadata(
+            name=name, type=content_type, description=description, nbytes=len(data),
+        ))
+
+    max_seq = client.get_status(principal=principal, token=token).max_seq
+    response = client.batch_get_object_metadata(keys[index] for index in (1, 0, 1))
+    assert list(response.metadata) == [expected[1], expected[0], expected[1]]
+    assert response.metadata[1].description.encode("utf-8") == entries[0][2].encode("utf-8")
+    assert list(client.batch_get_object_metadata([keys[0]]).metadata) == [expected[0]]
+    assert client.get_status(principal=principal, token=token).max_seq == max_seq
+
+
+def test_batch_object_metadata_rejects_invalid_batches_and_checks_every_token(
+    admin: AdminClient, client: OpenEventClient
+) -> None:
+    principal = 1803
+    token = _token(admin, principal)
+    written = client.write_object(
+        principal=principal, token=token, name="batch.bin",
+        type="application/octet-stream", data=b"batch",
+    )
+    valid = openevent_pb2.ObjectKey(object_id=written.object_id, object_token=written.object_token)
+    wrong_token = openevent_pb2.ObjectKey(object_id=written.object_id, object_token="wrong-token")
+    missing = openevent_pb2.ObjectKey(object_id=(1 << 64) - 1, object_token=written.object_token)
+    zero_id = openevent_pb2.ObjectKey(object_id=0, object_token=written.object_token)
+    empty_token = openevent_pb2.ObjectKey(object_id=written.object_id, object_token="")
+    invalid_batches = [
+        ([], grpc.StatusCode.INVALID_ARGUMENT),
+        ([valid] * 1025, grpc.StatusCode.INVALID_ARGUMENT),
+        ([zero_id], grpc.StatusCode.INVALID_ARGUMENT),
+        ([empty_token], grpc.StatusCode.INVALID_ARGUMENT),
+        # Validate the complete batch shape before looking up any object.
+        ([missing, zero_id], grpc.StatusCode.INVALID_ARGUMENT),
+        ([wrong_token, empty_token], grpc.StatusCode.INVALID_ARGUMENT),
+        ([valid, missing, valid], grpc.StatusCode.NOT_FOUND),
+        # Neither duplicate position may bypass its own token check.
+        ([valid, wrong_token, valid], grpc.StatusCode.NOT_FOUND),
+        ([wrong_token, valid], grpc.StatusCode.NOT_FOUND),
+    ]
+    for keys, expected_code in invalid_batches:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            client.batch_get_object_metadata(keys)
+        _assert_rpc_code(exc_info, expected_code)
+
+    assert len(client.batch_get_object_metadata([valid, valid]).metadata) == 2
+
+
+def test_batch_object_metadata_accepts_1024_maximum_size_metadata_entries(
+    admin: AdminClient, client: OpenEventClient
+) -> None:
+    principal = 1804
+    token = _token(admin, principal)
+    name = "名" * 85
+    content_type = "型" * 85
+    description = "🙂" * 1024
+    assert len(name.encode("utf-8")) == 255
+    assert len(content_type.encode("utf-8")) == 255
+    assert len(description.encode("utf-8")) == 4096
+    written = client.write_object(
+        principal=principal, token=token, name=name, type=content_type,
+        description=description, data=b"x",
+    )
+    key = openevent_pb2.ObjectKey(object_id=written.object_id, object_token=written.object_token)
+    response = client.batch_get_object_metadata([key] * 1024)
+    expected = openevent_pb2.ObjectMetadata(
+        name=name, type=content_type, description=description, nbytes=1,
+    )
+    assert len(response.metadata) == 1024
+    assert all(metadata == expected for metadata in response.metadata)
+    # The largest legal batch exceeds gRPC's default 4 MiB receive limit.
+    assert response.ByteSize() > 4 * 1024 * 1024
+
+
 def test_message_object_references(admin: AdminClient, client: OpenEventClient) -> None:
     principal = 1901
     reader = 1902

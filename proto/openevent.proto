@@ -30,6 +30,13 @@ message ObjectKey {
     string object_token = 2;      // Opaque credential used to authorize access to the referenced object
 }
 
+message ObjectMetadata {
+    string name = 1;
+    string type = 2;
+    string description = 3;
+    uint64 nbytes = 4;            // Total size of the object data in bytes
+}
+
 message EventMessage {
     uint64 seq = 1;               // Global sequence shared by system and business messages; 0 is global initialization
     uint64 ts_ms = 2;             // Unix milliseconds: business request receipt or system event commit time
@@ -152,6 +159,7 @@ message SubscribeResponse {
 service ObjectStorageService {
     rpc WriteObject(WriteObjectRequest) returns (WriteObjectResponse);
     rpc GetObjectMetadata(GetObjectMetadataRequest) returns (GetObjectMetadataResponse);
+    rpc BatchGetObjectMetadata(BatchGetObjectMetadataRequest) returns (BatchGetObjectMetadataResponse);
     rpc ReadObject(ReadObjectRequest) returns (ReadObjectResponse);
 }
 
@@ -179,6 +187,14 @@ message GetObjectMetadataResponse {
     string type = 2;
     string description = 3;
     uint64 nbytes = 4;            // Total size of the object data in bytes
+}
+
+message BatchGetObjectMetadataRequest {
+    repeated ObjectKey object_keys = 1;
+}
+
+message BatchGetObjectMetadataResponse {
+    repeated ObjectMetadata metadata = 1;  // One result per input key, in request order, including duplicates
 }
 
 message ReadObjectRequest {
