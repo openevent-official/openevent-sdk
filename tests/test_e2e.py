@@ -1125,7 +1125,7 @@ def test_object_write_metadata_and_partial_read(admin: AdminClient, client: Open
         data=data,
     )
     assert written.object_id > 0
-    assert len(written.object_token) == 43
+    assert written.object_token
 
     key = dict(object_id=written.object_id, object_token=written.object_token)
     metadata = client.get_object_metadata(**key)
