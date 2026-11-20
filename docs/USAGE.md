@@ -14,8 +14,8 @@ Build and install from this repository:
 make install
 ```
 
-See [Build and Test in the README](../README.md#build-and-test) for Python environment selection
-and installation arguments.
+For instructions on choosing a Python environment and a package source, see
+[Build and Test in the README](../README.md#build-and-test).
 
 ## Connect to the Service
 
@@ -33,8 +33,9 @@ and manage plaintext gRPC connections with a 64 MiB limit per sent or received
 message. Use the generated gRPC stubs for TLS or custom connection options.
 
 Both clients accept `timeout_ms`, defaulting to 30000 milliseconds (30 seconds),
-for non-streaming RPCs. Construction and reassignment require a finite number
-greater than zero, excluding booleans; invalid values raise `ValueError`.
+for non-streaming RPCs. On construction or reassignment, the value must be a
+number greater than zero and at most 2,147,483,647 milliseconds (about 24.9 days).
+Booleans and other invalid values raise `ValueError`.
 `timeout_ms` controls how long an ordinary RPC waits for its result, not the
 subscription lifetime or connection keepalive.
 Subscriptions continue until cancelled, ended by the server, or disconnected.
@@ -51,6 +52,40 @@ it closes the connection and cancels pending RPCs.
 with OpenEventClient("127.0.0.1:9527") as scoped_client:
     status = scoped_client.get_status(principal, token)
 ```
+
+### Use generated stubs through a TLS proxy
+
+When creating a gRPC channel, set both the send and receive message limits to 64 MiB.
+The default receive limit is 4 MiB. A 4 MiB object exceeds it once protobuf adds its fields.
+This example reads a whole object using an existing object key, `key`. Replace the example
+address with the address of your deployment's TLS proxy.
+
+```python
+import grpc
+from openevent.sdk.proto import openevent_pb2, openevent_pb2_grpc
+
+max_message_bytes = 64 * 1024 * 1024
+options = (
+    ("grpc.max_send_message_length", max_message_bytes),
+    ("grpc.max_receive_message_length", max_message_bytes),
+)
+with grpc.secure_channel(
+    "events.example.com:443", grpc.ssl_channel_credentials(), options=options
+) as channel:
+    objects = openevent_pb2_grpc.ObjectStorageServiceStub(channel)
+    response = objects.ReadObject(
+        openevent_pb2.ReadObjectRequest(
+            object_id=key.object_id,
+            object_token=key.object_token,
+            offset=0,
+            nbytes=4 * 1024 * 1024,
+        ),
+        timeout=30,
+    )
+```
+
+For `Subscribe` on a custom channel, also configure keepalive to match the server.
+See the [Subscribe API](API.md#37-subscribe).
 
 ### RPC Return Values
 
@@ -113,7 +148,7 @@ result = client.publish_auto_seq(
 print(result.seq)
 ```
 
-If the client needs CAS-style publishing, query status first and then call
+For CAS-style publishing, the client can query status first and then call
 `publish`:
 
 ```python
@@ -131,9 +166,10 @@ client.publish(
 )
 ```
 
-`payload` uses bytes. If a publish result is uncertain, retain the original UUID and follow the
-[recovery procedure](API.md#29-handling-an-uncertain-publish-result).
-Use `client.get_seq_by_uuid(uuid)` to look up the committed message position.
+`payload` uses bytes. If you do not receive a publish response, retry the same message
+with the original `uuid`. If the retry returns `ALREADY_EXISTS`, call
+`client.get_seq_by_uuid(uuid)` to get the committed message's sequence number.
+See [Handling an Uncertain Publish Result](API.md#29-handling-an-uncertain-publish-result).
 
 ## Write and Reference Objects
 
@@ -156,31 +192,30 @@ key = openevent_pb2.ObjectKey(
     object_token=written.object_token,
 )
 
+uuid = client.get_uuid()
 published = client.publish_auto_seq(
     principal=principal,
     token=token,
     channel_id=channel_id,
     payload=b"report ready",
     object_keys=[key],
-    uuid=client.get_uuid(),
+    uuid=uuid,
 )
 ```
 
-Use the ObjectKey to authorize metadata and byte-range reads:
+Use the ObjectKey to read the entire object in one call. The maximum object size is
+4 MiB. Requesting that many bytes from the start returns the object's actual contents.
 
 ```python
-metadata = client.get_object_metadata(
-    object_id=key.object_id,
-    object_token=key.object_token,
-)
-chunk = client.read_object(
+data = client.read_object(
     object_id=key.object_id,
     object_token=key.object_token,
     offset=0,
-    nbytes=metadata.nbytes,
-)
+    nbytes=4 * 1024 * 1024,
+).data
 ```
 
+Call `get_object_metadata` when you need the name, type, description, or a separate size lookup.
 Object limits, reference authorization, and errors are defined by the
 [object API](API.md#4-objectstorageservice)
 and [ObjectKey rules](API.md#27-object-capabilities-and-message-references).
@@ -190,7 +225,7 @@ list of object references in one call. For example, `message` is an already read
 message containing object references:
 
 ```python
-keys = list(message.object_keys)
+keys = message.object_keys
 batch = client.batch_get_object_metadata(keys)
 for key, metadata in zip(keys, batch.metadata):
     print(key.object_id, metadata.name, metadata.nbytes)
@@ -246,6 +281,10 @@ for item in client.subscribe(
     print(message.seq, message.payload)
 ```
 
+The subscription iterator keeps its client alive. A function can create a client and return
+just the iterator, and the caller can continue receiving messages. Calling `client.close()`
+or leaving the client's `with` block cancels all active subscriptions on that client.
+
 `wait_started(timeout_ms)` waits for the acceptance marker defined by the
 [Subscribe API](API.md#37-subscribe) in the initial metadata. It returns `None`
 on success and remembers that this stream was accepted. Even if the stream has
@@ -274,38 +313,41 @@ and resubscribe according to the API resume rules.
 
 ## Discover Channels Through Messages
 
-Applications can rebuild their Channel lists from historical messages and then
-discover new Channels through subscriptions, without periodically calling
-`ListChannels`. At startup, use `get_status` to record message watermark `H`, then
-read from `from_seq=0` through that watermark using
-`fetch(channels=[], only_my_recipient=False)`, handling system events and restoring
-application state. Continue receiving currently readable messages with
-`subscribe(from_seq=H+1, channels=[], only_my_recipient=False)`.
+To discover Channels continuously from the start of history, call
+`client.subscribe(principal, token, from_seq=0, channels=[], only_my_recipient=False)`.
+Handle system messages in a single loop. The subscription delivers visible
+historical messages and waits for new messages at the tail.
 
+If the application needs to know when it has processed the messages that existed
+at startup, it can read pages with `fetch` up to the `last_seq` reported on the
+first page, then subscribe from the following sequence number.
+
+The application maintains its Channel list and recovery progress.
 See the [system protocol](SYSTEM_PROTOCOL.md) for message contents and
 [Discovering Channels Through Messages](API.md#38-discovering-channels-through-messages)
-for the full reading, handoff, and permission rules. The SDK does not maintain
-Channel lists or recovery progress.
+for pagination, handoff, and permission rules.
 
 ## Targeted Messages
 
-Pass `recipients` when publishing. This example uses members 1002 and 1003,
+You can pass `recipients` when publishing. This example uses members 1002 and 1003,
 who were added in the Create a Channel example:
 
 ```python
+uuid = client.get_uuid()
 client.publish_auto_seq(
     principal=principal,
     token=token,
     channel_id=channel_id,
     recipients=[1002, 1003],
-    payload=b"private note for selected members",
-    uuid=client.get_uuid(),
+    payload=b"meeting reminder",
+    uuid=uuid,
 )
 ```
 
-Set `only_my_recipient=True` when reading to select messages targeted to you.
-Membership requirements and filtering semantics are defined in the
-[Recipients API](API.md#26-recipients).
+The Channel's read permissions determine who can read the reminder. This Channel
+is public, so every authenticated user can read it. With `only_my_recipient=True`,
+only users 1002 and 1003 see it in their filtered results.
+See [Channel ACL](API.md#25-channel-acl) and [Recipients](API.md#26-recipients).
 
 ## Manage Tokens
 
@@ -340,8 +382,9 @@ and branch on the status code:
 ```python
 import grpc
 
+uuid = client.get_uuid()
 try:
-    client.publish_auto_seq(principal, token, channel_id, b"hello", uuid=client.get_uuid())
+    client.publish_auto_seq(principal, token, channel_id, b"hello", uuid=uuid)
 except grpc.RpcError as exc:
     if exc.code() == grpc.StatusCode.UNAUTHENTICATED:
         print("invalid token")

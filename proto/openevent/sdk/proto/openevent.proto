@@ -52,7 +52,7 @@ message ChannelInfo {
     uint64 channel_id = 1;
     string name = 2;
     Visibility visibility = 3;
-    string protocol = 4;          // Protocol label; the server does not validate it
+    string protocol = 4;          // Protocol label interpreted by the application
     string description = 5;
     optional uint64 creator = 6;  // Creator principal; unset for the system Channel
     repeated uint64 members = 7;  // Member principal list; empty for the system Channel
@@ -173,7 +173,7 @@ message WriteObjectRequest {
 }
 
 message WriteObjectResponse {
-    uint64 object_id = 1;         // Global monotonically increasing object ID; 0 is reserved; committed IDs are not reused
+    uint64 object_id = 1;         // Increases globally in reservation order. Zero is reserved and IDs are never reused.
     string object_token = 2;      // Opaque credential for authorizing subsequent operations on this object
 }
 

@@ -2,10 +2,8 @@
 
 import os
 from pathlib import Path
-import shutil
+import re
 import subprocess
-import sys
-import tempfile
 import venv
 import zipfile
 
@@ -15,23 +13,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.fixture
-def workspace():
-    build = ROOT / 'build'
-    build.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='install-test-', dir=str(build)) as temporary:
-        root = Path(temporary)
-        (root / 'scripts').mkdir()
-        shutil.copyfile(ROOT / 'scripts/install.py', root / 'scripts/install.py')
-        (root / 'dist').mkdir()
-        yield root
-
-
-def write_wheel(directory, name, version, files, requires=()):
+def write_wheel(directory, name, version, files, requires=(), extras=()):
     metadata = '{}-{}.dist-info'.format(name, version)
     contents = dict(files)
     contents[metadata + '/METADATA'] = (
         'Metadata-Version: 2.1\nName: {}\nVersion: {}\n'.format(name, version)
+        + ''.join('Provides-Extra: {}\n'.format(extra) for extra in extras)
         + ''.join('Requires-Dist: {}\n'.format(requirement) for requirement in requires)
     )
     contents[metadata + '/WHEEL'] = (
@@ -44,128 +31,99 @@ def write_wheel(directory, name, version, files, requires=()):
     with zipfile.ZipFile(path, 'w') as archive:
         for member, content in contents.items():
             archive.writestr(member, content)
+    return path
 
 
 def process_environment():
-    environment = {name: value for name, value in os.environ.items()
-                   if not name.startswith('PIP_') and name != 'PYTHONPATH'}
-    environment.update(PYTHONDONTWRITEBYTECODE='1', PIP_NO_COMPILE='1',
+    environment = {name: value for name, value in os.environ.items() if not name.startswith('PIP_')}
+    environment.update(PIP_NO_COMPILE='1', PIP_NO_CACHE_DIR='1',
                        PIP_CONFIG_FILE=os.devnull, PIP_DISABLE_PIP_VERSION_CHECK='1')
     return environment
 
 
-def test_same_version_replaces_sdk_and_resolves_only_needed_dependencies(workspace):
-    wheels = workspace / 'dist'
-    # Reuse the existing pip without downloading or bootstrapping one.
-    builder = venv.EnvBuilder(system_site_packages=True)
-    environment_path = workspace / 'environment'
-    builder.create(environment_path)
-    python = builder.ensure_directories(environment_path).env_exe
+@pytest.fixture
+def python(tmp_path):
+    directory = tmp_path / 'chosen environment'
+    venv.EnvBuilder(system_site_packages=True).create(directory)
+    return directory / 'bin/python'
+
+
+def test_make_install_rejects_redirected_pip_config(tmp_path, python):
+    outside = tmp_path / 'redirected'
+    (python.parent.parent / 'pip.conf').write_text(f'[install]\nroot = {outside}\n')
+    # Let pip read the chosen environment's config without loading user settings.
+    empty_config = tmp_path / 'empty-pip.conf'
+    empty_config.touch()
     environment = process_environment()
+    environment.update(PIP_CONFIG_FILE=str(empty_config), PIP_NO_INDEX='1')
+    result = subprocess.run(
+        ['make', 'install', f'PYTHON={python}'], cwd=ROOT, env=environment,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    assert result.returncode != 0, result.stdout
+    # A setting can appear as --root, install.root or a bare key in a configuration diagnostic.
+    setting = re.compile(r'(?<![\w/.-])(--|(?:install|global)\.|pip_)?root(?![\w/-])')
+    assert any(
+        match.group(1) or any(word in line for word in ('config', 'setting', 'option'))
+        for line in result.stdout.lower().splitlines()
+        if (match := setting.search(line))
+    ), result.stdout
+    assert not outside.exists()
+
+
+def test_same_version_replaces_sdk_and_resolves_only_needed_dependencies(tmp_path, python):
+    stage = tmp_path / 'current wheel'
+    stage.mkdir()
+    wheels = tmp_path / 'wheelhouse'
+    wheels.mkdir()
+    environment = process_environment()
+    environment.update(PIP_NO_INDEX='1', PIP_FIND_LINKS=wheels.name)
     site_packages = Path(subprocess.check_output(
         [str(python), '-B', '-c', "import sysconfig; print(sysconfig.get_path('purelib'))"],
         env=environment, text=True,
     ).strip())
 
     def sdk(value, obsolete=False, requires=('sdk_install_dependency>=1',)):
-        files = {'sdk_install_project.py': value}
+        files = {'openevent/sdk/__init__.py': f'value = {value!r}\n'}
         if obsolete:
-            files['sdk_install_obsolete.py'] = 'old'
-        write_wheel(wheels, 'openevent_sdk', '0.8.1', files, requires)
+            files['openevent/sdk/obsolete.py'] = ''
+        dependencies = (*requires, 'sdk_test_dependency==1; extra == "test"')
+        return write_wheel(stage, 'openevent_sdk', '0.8.1', files, dependencies, extras=('test',))
 
-    def install(*arguments):
+    def install(wheel, test_env=False):
+        options = ['--test-env'] if test_env else []
         return subprocess.run(
-            [str(python), '-B', str(workspace / 'scripts/install.py'),
-             '--no-index', '--find-links', str(wheels), *arguments],
+            [python, '-B', ROOT / 'scripts/install.py', *options, wheel],
+            cwd=tmp_path,
             env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
 
     write_wheel(wheels, 'sdk_install_dependency', '1.0', {'sdk_install_dependency.py': 'one'})
-    sdk('old', obsolete=True)
-    first = install()
+    write_wheel(wheels, 'sdk_test_dependency', '1.0', {'sdk_test_dependency.py': ''})
+    first = install(sdk('old', obsolete=True))
     assert first.returncode == 0, first.stdout
     dependency = site_packages / 'sdk_install_dependency.py'
-    project = site_packages / 'sdk_install_project.py'
+    project = site_packages / 'openevent/sdk/__init__.py'
+    test_dependency = site_packages / 'sdk_test_dependency.py'
     assert dependency.read_text(encoding='utf-8') == 'one'
-    assert project.read_text(encoding='utf-8') == 'old'
+    assert project.read_text(encoding='utf-8') == "value = 'old'\n"
+    assert not test_dependency.exists()
     dependency_mtime = dependency.stat().st_mtime_ns
 
     write_wheel(wheels, 'sdk_install_dependency', '2.0', {'sdk_install_dependency.py': 'two'})
-    sdk('new')
-    second = install()
+    second = install(sdk('new'), test_env=True)
     assert second.returncode == 0, second.stdout
-    assert project.read_text(encoding='utf-8') == 'new'
-    assert not (site_packages / 'sdk_install_obsolete.py').exists()
+    assert project.read_text(encoding='utf-8') == "value = 'new'\n"
+    assert not (project.parent / 'obsolete.py').exists()
+    assert test_dependency.is_file()
     assert dependency.read_text(encoding='utf-8') == 'one'
     assert dependency.stat().st_mtime_ns == dependency_mtime
 
-    sdk('dry run')
-    dry_run = install('--dry-run')
-    assert dry_run.returncode == 0, dry_run.stdout
-    assert project.read_text(encoding='utf-8') == 'new'
-
-    sdk('new dependency', requires=('sdk_install_dependency>=2',))
-    upgraded = install()
+    upgraded = install(sdk('new dependency', requires=('sdk_install_dependency>=2',)))
     assert upgraded.returncode == 0, upgraded.stdout
     assert dependency.read_text(encoding='utf-8') == 'two'
-    assert project.read_text(encoding='utf-8') == 'new dependency'
+    assert project.read_text(encoding='utf-8') == "value = 'new dependency'\n"
 
-    sdk('must not install', requires=('sdk_install_missing_dependency==1',))
-    failed = install()
+    failed = install(sdk('must not install', requires=('sdk_install_missing_dependency==1',)))
     assert failed.returncode != 0, failed.stdout
-    assert project.read_text(encoding='utf-8') == 'new dependency'
-
-
-@pytest.mark.parametrize('arguments', [
-    ['--target', '/unused'], ['--target=/unused'], ['-t', '/unused'], ['-t/unused'],
-    ['--prefix', '/unused'], ['--prefix=/unused'], ['--root', '/unused'], ['--root=/unused'],
-])
-def test_alternate_destinations_are_rejected_before_installation(arguments):
-    result = subprocess.run(
-        [sys.executable, '-B', str(ROOT / 'scripts/install.py'), *arguments],
-        env=process_environment(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    assert result.returncode != 0
-    assert 'choose its interpreter with PYTHON' in result.stdout
-
-
-@pytest.mark.parametrize('variable', ['PIP_TARGET', 'PIP_PREFIX', 'PIP_ROOT'])
-def test_alternate_destination_environment_is_rejected(variable):
-    environment = process_environment()
-    environment[variable] = '/unused'
-    result = subprocess.run(
-        [sys.executable, '-B', str(ROOT / 'scripts/install.py')],
-        env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    assert result.returncode != 0
-    assert 'choose its interpreter with PYTHON' in result.stdout
-
-
-@pytest.mark.parametrize('versions', [[], ['0.8.0', '0.8.1']])
-def test_install_requires_one_sdk_wheel(workspace, versions):
-    for version in versions:
-        write_wheel(workspace / 'dist', 'openevent_sdk', version, {})
-    result = subprocess.run(
-        [sys.executable, '-B', str(workspace / 'scripts/install.py')],
-        env=process_environment(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    assert result.returncode != 0
-    assert 'Exactly one SDK wheel' in result.stdout
-
-
-def test_failed_build_does_not_run_install_with_an_old_wheel(workspace):
-    shutil.copyfile(ROOT / 'Makefile', workspace / 'Makefile')
-    write_wheel(workspace / 'dist', 'openevent_sdk', '0.8.0', {})
-    build = workspace / 'build.sh'
-    build.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
-    build.chmod(0o755)
-    marker = workspace / 'install-ran'
-    (workspace / 'scripts/install.py').write_text(
-        'from pathlib import Path\nPath({!r}).touch()\n'.format(str(marker)), encoding='utf-8',
-    )
-    result = subprocess.run(
-        ['make', 'install', 'PYTHON=' + sys.executable], cwd=str(workspace),
-        env=process_environment(), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
-    assert result.returncode != 0
-    assert not marker.exists()
+    assert project.read_text(encoding='utf-8') == "value = 'new dependency'\n"

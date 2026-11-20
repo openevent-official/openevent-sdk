@@ -13,7 +13,7 @@ schema. RPC behavior and gRPC status semantics are defined by the
 
 OpenEvent generates all system messages on the server, with
 `EventMessage.principal=0`. Clients MUST NOT use `principal=0` in business
-requests or create system messages through ordinary publishing RPCs.
+requests. Clients cannot create system messages through ordinary publishing RPCs.
 
 System and application messages use the same `EventMessage` type. An ordinary
 Channel's `protocol` still identifies its application protocol. Readers first
@@ -166,7 +166,7 @@ filters out all system messages. A principal removed from a private Channel is
 not guaranteed to receive its removal message. System messages have no read
 permission exception.
 
-For Channel discovery by reading history and then subscribing, see
+For Channel discovery using these system messages, see
 [Discovering Channels Through Messages](API.md#38-discovering-channels-through-messages).
 Starting-sequence, pagination, and error rules for each reader are defined in
 [Fetch](API.md#36-fetch), [Subscribe](API.md#37-subscribe), and

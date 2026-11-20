@@ -6,8 +6,10 @@
 > Date: 2026-10-28
 
 This document defines the public behavior of the business protocol
-[`proto/openevent.proto`](../proto/openevent.proto) and management protocol
-[`proto/admin.proto`](../proto/admin.proto).
+[`proto/openevent/sdk/proto/openevent.proto`](../proto/openevent/sdk/proto/openevent.proto) and management protocol
+[`proto/openevent/sdk/proto/admin.proto`](../proto/openevent/sdk/proto/admin.proto).
+When generating bindings, pass the SDK's `proto/` directory as the protobuf include root.
+In your own schemas, import `openevent/sdk/proto/openevent.proto` or `openevent/sdk/proto/admin.proto`.
 
 ## 1. Basic Conventions
 
@@ -38,7 +40,7 @@ This document defines the public behavior of the business protocol
 | `EventService` | Status queries, publishing, batch fetch, and streaming subscription |
 | `ObjectStorageService` | Immutable object writes, single/batch metadata queries, and partial data reads |
 | `ChannelService` | Channel creation, queries, listing, and member management |
-| `AdminService` | Token management and administrative message queries |
+| `AdminService` | Token management and administrative queries over all messages |
 
 ### 1.2 Data History and Backup Restoration
 
@@ -71,7 +73,7 @@ or convert cursors, retry state, or references across histories.
 | `PERMISSION_DENIED` | ACL check failed or the operation is not allowed |
 | `NOT_FOUND` | Channel does not exist, or an object capability is absent or invalid |
 | `ALREADY_EXISTS` | Resource already exists, such as an existing member or a UUID already used by a message |
-| `INVALID_ARGUMENT` | Missing/invalid fields or invalid recipients |
+| `INVALID_ARGUMENT` | Missing or invalid fields, or recipients that do not meet Channel membership requirements |
 | `RESOURCE_EXHAUSTED` | payload or total Channel membership exceeds its limit, or object-file storage has insufficient space/quota/inodes |
 | `OUT_OF_RANGE` | ReadObject offset is greater than the object size, or Subscribe starts beyond `max_seq + 1` |
 | `ABORTED` | `Publish.req.seq != max_seq + 1` |
@@ -81,9 +83,8 @@ or convert cursors, retry state, or references across histories.
 | `DATA_LOSS` | Persistent storage is corrupt; the server exits |
 | `INTERNAL` | Unexpected error |
 
-The object-storage part of `RESOURCE_EXHAUSTED` covers only space, quota, or inode
-exhaustion during object-file writes, syncs, or cleanup. Metadata storage write
-failures return `UNAVAILABLE` and trigger server shutdown.
+Object storage returns `RESOURCE_EXHAUSTED` only when object-file writes, syncs, or cleanup
+exhaust space, quota, or inodes.
 
 A fatal storage failure stops new calls and causes a nonzero process exit. The
 triggering RPC makes a best effort to return its original error: `DATA_LOSS` for
@@ -98,8 +99,8 @@ Handle errors by gRPC status code.
 - `seq=0` is the permanent global initialization message. `max_seq=0` means
   that only this message exists.
 - Committed values are not reused.
-- Application messages and Channel system messages both advance seq from
-  `max_seq + 1`. Readers continue with the cursor returned by the server.
+- Each application message and Channel system message takes the next sequence
+  number, `max_seq + 1`. Readers continue with the cursor returned by the server.
   Channel creation and actual membership changes also advance `max_seq` and can
   cause a concurrent Publish seq CAS to return `ABORTED`.
 - `GetStatus`, `Fetch`, and `Subscribe` all use this sequence.
@@ -155,6 +156,8 @@ the removal event.
 - recipients is the targeted principal list; an empty list means no targets.
 - Every recipient must be a Channel member when publishing, otherwise the server
   returns `INVALID_ARGUMENT`.
+- `Publish` and `PublishAutoSeq` store each recipient once, in order of first
+  appearance in the request. Reads return the list as stored.
 - With `only_my_recipient=true`, only messages targeting the current principal
   are returned or pushed; messages with empty recipients do not match.
 
@@ -177,16 +180,16 @@ the removal event.
 ### 2.8 Read/Write Linearization and Commit Ordering
 
 - All mutations and non-streaming stateful business/administrative reads have one
-  server-side global order. Writes commit in that order, while non-streaming reads
+  server-side global order. State changes commit in that order, while non-streaming reads
   acquire a consistent snapshot at their position. Subscribe is excluded.
-- Publish evaluates the `principal + token` pair and Channel write permission against the latest
+- When publishing, the server checks the `principal + token` pair and Channel write permission against the latest
   committed state preceding the message commit. No token or Channel mutation can
   intervene between those checks and the commit.
 - If RemoveMember commits first on a protected or private Channel, a later publish
   by that removed member using an unconsumed UUID returns `PERMISSION_DENIED`;
   public Channel writes are not controlled by membership. If DeleteToken commits first, a later publish using
   that deleted pair returns `UNAUTHENTICATED`; the same token string under another
-  principal is unaffected. A message committed first remains valid.
+  principal is unaffected. A message published successfully before the change remains committed.
 - WriteObject may interleave with other operations while processing. Only a fully
   and durably committed object is visible to reads and message references; that
   complete commit is the write's ordering point.
@@ -195,16 +198,15 @@ the removal event.
   metadata, the system message, UUID allocation and consumption, and `max_seq`
   either all commit or none do. The initialization message is the new Channel's
   first message, preceding all application and membership-change messages in it.
-- A write returns success only after it has been synchronously and durably
-  persisted. Success means the mutation satisfies the server durability contract.
-- A non-streaming read issued after a write RPC returned success must observe the
-  complete result of that write. Overlapping mutations and non-streaming reads
-  observe the complete state before or after a commit according to the server
-  global order, never a partial commit.
+- A write that changes state returns success after the change is synchronously
+  persisted. When the target is a non-member, RemoveMember's position in the global
+  order is the point where it confirms the member is absent. It then returns success.
+- Overlapping mutations and non-streaming reads observe the complete state before
+  or after a commit according to the server global order, never a partial commit.
 - Subscribe batch visibility and starting-sequence rules are defined in section
-  3.7. For a fixed message watermark, record GetStatus.max_seq, then use Fetch and
-  process only messages through that watermark. This does not freeze permissions
-  across RPCs.
+  3.7. When reading history in a separate phase before subscribing, use the first
+  Fetch page's `last_seq` as the fixed watermark as described in section 3.8.
+  Permissions are evaluated separately on each RPC.
 
 ### 2.9 Handling an Uncertain Publish Result
 
@@ -264,9 +266,9 @@ rpc GetSeqByUuid(GetSeqByUuidRequest) returns (GetSeqByUuidResponse);
 ```
 
 The request contains only `uuid`; it carries no `principal` or `token`. This unauthenticated read does not change
-allocation or message state. UUID 0 returns `seq=0` for the global initialization message. For other UUIDs, the
-server returns `NOT_FOUND` unless the UUID has already been consumed by a committed message, including when the UUID
-was never allocated or was allocated but has not been used. On success, `seq` is the committed message sequence that
+allocation or message state. UUID 0 returns `seq=0` for the global initialization message. For other UUIDs,
+the server returns `NOT_FOUND` unless a committed message has consumed the UUID. This covers both unallocated
+UUIDs and allocated but unused UUIDs. On success, `seq` is the sequence number of the committed message that
 consumed the UUID.
 
 ### 3.4 Publish
@@ -275,9 +277,14 @@ consumed the UUID.
 rpc Publish(PublishRequest) returns (PublishResponse);
 ```
 
-Publishes with a client-specified CAS seq. Success requires valid authentication,
-an allowed payload size, `seq == max_seq+1`, an existing writable Channel, valid
-recipients, and valid object capabilities.
+The client supplies `seq` for a compare-and-set publish. All of the following conditions must hold.
+
+- The `principal + token` pair is valid.
+- The payload is within the size limit.
+- The requested `seq` equals the current `max_seq + 1`.
+- The Channel exists and the caller has write permission.
+- The recipients meet the requirements in section 2.6.
+- The `object_keys` meet the requirements in section 2.7.
 
 UUID validation, duplicate precedence, and recovery rules are defined in sections 2.4 and 2.9.
 
@@ -291,8 +298,8 @@ UUID validation, duplicate precedence, and recovery rules are defined in section
 | More than 1024 ObjectKeys, object ID 0, or empty object token | `INVALID_ARGUMENT` |
 | Missing/uncommitted object or object token mismatch | `NOT_FOUND` |
 
-Success returns an empty response. The server sets `ts_ms` before the message is
-made available to authorized readers.
+Success returns an empty response. The server sets `ts_ms`, and authorized callers
+can then read the message or receive it through a subscription.
 
 ### 3.5 PublishAutoSeq
 
@@ -309,13 +316,15 @@ recovery rules are defined in sections 2.4 and 2.9. The response contains the co
 rpc Fetch(FetchRequest) returns (FetchResponse);
 ```
 
+The request follows these rules.
+
 - The `principal + token` pair must be valid.
 - limit must be in `1..1000`.
 - Empty channels means no Channel filter. When non-empty, every listed Channel
   must exist and be readable by the caller; otherwise the whole request returns
   an error: `NOT_FOUND` for a missing Channel and `PERMISSION_DENIED` for an
-  unreadable Channel. After validation, normal ACL still applies to the selected
-  Channels.
+  unreadable Channel. After validation, Fetch returns only messages the caller
+  can read from the listed Channels.
 - `only_my_recipient=true` enables recipient filtering.
 
 | `from_seq` | Behavior |
@@ -324,16 +333,20 @@ rpc Fetch(FetchRequest) returns (FetchResponse);
 | `> max_seq` | Empty result with `next_seq=max_seq+1`, `last_seq=max_seq` |
 | `1..max_seq` | Scan visible messages from this seq |
 
-The response contains at most limit messages matching ACL, Channel, and recipient
-filters. A server may end a page early because of scan or response-size budgets,
-so a short page, or an empty page
-after scanning invisible messages, does not imply end of stream. A single
-returnable message may exceed the page's soft size budget but remains subject to
-the gRPC transport limit; the soft budget never causes an empty-page loop at the
-same cursor. `next_seq` is the suggested continuation point and `last_seq` is the
-highest committed seq observed by this response. Continue while
-`next_seq <= last_seq`; a larger next_seq means the observed tail was reached.
-Filtering never moves next_seq backward.
+The response follows these rules.
+
+- `messages` contains at most `limit` messages matching the ACL, Channel, and recipient filters.
+  Within each page, messages are ordered by strictly increasing `seq`. Filtering can leave gaps in the sequence numbers.
+- The scan budget or the per-page message byte budget can end a page before `limit`.
+  A page may even be empty after scanning invisible messages. Use the returned `next_seq`
+  to continue after a short or empty page.
+- A single matching message may exceed the soft page budget and is still subject to the
+  gRPC transport limit. The soft budget never causes an empty-page loop at the same cursor.
+- `next_seq` is the suggested starting point for the next scan.
+- `last_seq` is the highest committed sequence number observed by this response.
+- Continue while `next_seq <= last_seq`. When `next_seq > last_seq`, the scan has reached
+  the tail observed by this response.
+- Neither ACL nor filtering moves `next_seq` backward.
 
 ### 3.7 Subscribe
 
@@ -341,29 +354,28 @@ Filtering never moves next_seq backward.
 rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 ```
 
-Pushes messages visible to the caller in global seq order. The `principal + token`
-pair must be valid. Empty `channels` disables Channel filtering.
-When non-empty, every listed Channel must exist and
-be readable by the caller; otherwise the stream returns an error: `NOT_FOUND` for
-a missing Channel and `PERMISSION_DENIED` for an unreadable Channel. After
-validation, only readable messages from the listed Channel IDs are pushed.
-Normal Channel ACL and `only_my_recipient` filtering still apply. Filtered
-records do not produce responses but are consumed by the server's scan. If an
-explicitly listed Channel becomes unreadable while the stream is running, a
-later batch returns `PERMISSION_DENIED` and ends the stream. Subscribe is outside
-the non-streaming read/write linearization order and has no linearization point
-relative to concurrent RPCs. Each batch
-uses a consistent read view covering commits completed before that batch began;
-those commits become visible by the next successful 100 ms view refresh.
+Pushes messages visible to the caller in global `seq` order.
 
-With no channels specified, later batches automatically include newly created
-readable Channels and Channels for which the caller gains read permission,
-without rebuilding the subscription. Previously filtered and consumed messages
-are not replayed. A permission change makes later batches filter out private
-Channels that are no longer readable; it does not end the whole stream.
-Removing a member from a protected Channel does not change read permission.
-Deleting the subscription's `principal + token` pair makes the next batch return
-`UNAUTHENTICATED` and end the stream.
+- The `principal + token` pair must be valid.
+- Subscribe is outside the global order of non-streaming reads and writes and has no
+  linearization point relative to concurrent RPCs. Each batch uses a consistent view
+  that includes commits completed before the batch began. Those commits become visible
+  by the next successful 100 ms view refresh.
+- An empty `channels` list disables filtering by Channel ID. Otherwise, every listed
+  Channel must exist and be readable by the caller. The whole stream returns `NOT_FOUND`
+  for a missing Channel or `PERMISSION_DENIED` for an unreadable one. After validation,
+  the server pushes only readable messages from the listed Channels.
+- `only_my_recipient=true` enables recipient filtering.
+- After validation, the server scans past records excluded by ACL, Channel, or recipient
+  filters without sending a response for them. If an explicitly listed Channel becomes
+  unreadable, a later batch returns `PERMISSION_DENIED` and ends the stream.
+- With no Channels specified, later batches automatically include newly created readable
+  Channels and Channels for which the caller gains read permission. The caller can keep
+  the same subscription. Previously filtered and consumed messages are not replayed.
+  Later batches filter out private Channels that become unreadable and the stream continues.
+  Removing a member from a protected Channel does not change read permission.
+  Deleting the subscription's `principal + token` pair makes the next batch return
+  `UNAUTHENTICATED` and end the stream.
 
 | `from_seq` | Behavior |
 |------------|----------|
@@ -386,7 +398,7 @@ are filtered out. Empty metadata, unrelated entries, or any other value for this
 key do not confirm acceptance. The server must not send the marker when rejecting
 a subscription before acceptance.
 
-A Subscribe stream stays open until interrupted. The public gRPC endpoint sends
+A Subscribe stream stays open until interrupted. The business gRPC endpoint sends
 an HTTP/2 PING after 30 seconds without transport activity and closes a connection
 whose PING acknowledgement does not
 arrive within 10 seconds. It accepts client PINGs no more frequent than every 20
@@ -412,29 +424,33 @@ Fetch.
 
 ### 3.8 Discovering Channels Through Messages
 
-Callers can discover Channels from [Channel system messages](SYSTEM_PROTOCOL.md)
-while restoring message history, without an initial or periodic ListChannels
-call. Initialization and ongoing subscription use the same message handling:
+To discover Channels continuously from the start of history, open one Subscribe
+stream with `from_seq=0`, `channels=[]`, and `only_my_recipient=false`. The server
+delivers visible historical messages in order and waits for new messages at the
+tail. No initial Fetch or ListChannels call is needed.
 
-1. Call GetStatus and record the fixed watermark `H=max_seq`.
-2. Fetch from `from_seq=0` with `channels=[]` and `only_my_recipient=false`.
-   Follow `next_seq` and process only messages with `seq<=H`. History reading is
-   complete only when `next_seq>H`, never merely because a page is short or empty.
-3. Handle system messages according to the system protocol. The caller decides
-   which readable Channels belong in its application list using protocol and
-   membership information. Read permission does not imply membership. If only
-   a member-added event was received and Channel attributes are missing, call
-   GetChannel once with that `channel_id`; no history replay or list scan is needed.
-4. After restoring history, start Subscribe with `from_seq=H+1`, `channels=[]`,
-   and `only_my_recipient=false`. Messages committed during recovery are read
-   from this point. Resume after interruptions according to section 3.7.
+Use the protocol and membership information in [Channel system messages](SYSTEM_PROTOCOL.md)
+to decide which readable Channels belong in the application's list. Nonmembers can also
+read public and protected Channels. If a member-added event arrives and Channel attributes
+are missing, call GetChannel once with that `channel_id`.
 
-This fixes the message watermark, not ACL across RPCs. Gaining read permission
-does not replay history before the cursor; callers needing that history must
-Fetch the relevant Channel separately. System messages follow current read
-permissions in section 2.5 and recipient filtering. Therefore discovery cannot
-use `only_my_recipient=true`, and this procedure does not guarantee notification
-of removal from a private Channel.
+If the caller needs to know when it has processed the messages that existed at
+startup, it can page through Fetch before subscribing.
+
+1. Fetch from `from_seq=0` with `channels=[]` and `only_my_recipient=false`.
+   Record the first page's `last_seq` as the fixed watermark `H`, even if the page is empty.
+2. Starting with the first page, process only messages with `seq<=H`. While
+   `next_seq<=H`, fetch the next page from `next_seq`, including after a short or empty
+   page. Later pages may report a higher `last_seq`. Keep the original `H` throughout.
+3. Once `next_seq>H`, the startup history is complete. Subscribe from `from_seq=H+1`
+   with the same filters to receive messages committed during and after recovery.
+
+For either approach, resume interrupted subscriptions as described in section 3.7.
+Each Fetch page and Subscribe batch uses the read permissions in effect for that page or batch.
+Gaining read permission does not replay history before the cursor. Fetch the relevant
+Channel separately if that history is needed. Recipient filtering also applies to system
+messages, so `only_my_recipient=true` cannot be used for discovery. Notification of removal
+from a private Channel follows section 2.5.
 
 ## 4. ObjectStorageService
 
@@ -453,15 +469,18 @@ rpc WriteObject(WriteObjectRequest) returns (WriteObjectResponse);
 - `data` must contain `1..4,194,304` bytes. The 4 MiB limit is fixed and is not
   affected by the message payload configuration.
 - The server stores these strings as opaque metadata and stores object data as supplied.
-- Success returns a nonzero globally increasing `object_id` and an opaque
-  `object_token`. IDs can contain gaps and are never reused. Objects are immutable.
+- Success returns a nonzero `object_id` and an opaque `object_token`. Object IDs
+  increase globally in the order the server reserves them. Gaps are possible and IDs
+  are never reused. With concurrent uploads, the object with the higher ID may commit
+  first, and its call may also return first. Objects are immutable.
 - Success is returned only after object data and metadata are durably committed.
   If the result is uncertain after interruption, retrying may create another object.
 
-Invalid metadata or data size returns `INVALID_ARGUMENT`. Invalid principal/token
-returns `UNAUTHENTICATED`. Object-file storage space, quota, or inode exhaustion
-returns `RESOURCE_EXHAUSTED`; other storage availability failures return
-`UNAVAILABLE`. Fatal storage failures follow section 2.1.
+The server returns `INVALID_ARGUMENT` if `principal=0`, the metadata is invalid, or the data size
+is outside the allowed range. An invalid combination of a nonzero principal and token returns
+`UNAUTHENTICATED`. Object-file storage space, quota, or inode exhaustion returns
+`RESOURCE_EXHAUSTED`. Other storage availability failures return `UNAVAILABLE`.
+Fatal storage failures follow section 2.1.
 
 ### 4.2 GetObjectMetadata
 
@@ -510,16 +529,17 @@ ordinary `principal + token` is required.
   the entire list and that every item has a nonzero `object_id` and a nonempty
   `object_token`. Any violation returns `INVALID_ARGUMENT`.
 - After input validation, the entire batch uses one database snapshot at one
-  linearization point to read committed metadata and check each capability. A
-  missing or uncommitted object or a token mismatch returns `NOT_FOUND`, as with
-  a single-object query.
+  linearization point to read committed metadata and check each capability in
+  input order. A missing or uncommitted object or a token mismatch gives that
+  item a `NOT_FOUND` error.
 - On success, `metadata` has exactly the same length and order as the request;
   each item is an independent `ObjectMetadata` message with the same fields as
-  the single-object response in section 4.2. Duplicate ObjectKeys are preserved.
-  Different tokens for the same `object_id` are each checked.
-- If any item fails, the entire RPC fails without partial results. After input
-  validation, objects are queried in input order and the first error encountered
-  is returned. Storage failures still follow section 2.1.
+  the single-object response in section 4.2. Each occurrence of a duplicate
+  ObjectKey gets its own result. Different tokens for the same `object_id` are each checked.
+- If any item fails, the entire RPC returns one error and no partial results.
+  Storage corruption (`DATA_LOSS`) takes precedence over other fatal storage
+  failures (`UNAVAILABLE`), which in turn take precedence over `NOT_FOUND`.
+  Both kinds of storage failure trigger server shutdown as described in section 2.1.
 
 The fixed batch limit bounds the work and response size of one query. It does not
 change the metadata limits for individual objects.
@@ -556,6 +576,9 @@ rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
   event. See the [system protocol](SYSTEM_PROTOCOL.md) for the message schema
   and section 2.8 for atomic commitment with Channel state.
 - Success returns the created ChannelInfo.
+- If the request times out or the success response is lost, the Channel may already exist.
+  If you retry with the same arguments and both requests commit, the current data history
+  permanently retains two Channels with the same name, each with its own ID and initialization message.
 
 ### 5.2 GetChannel
 
@@ -565,9 +588,9 @@ rpc GetChannel(GetChannelRequest) returns (GetChannelResponse);
 
 - The request must authenticate with `principal + token`, and `principal` must
   be greater than zero.
-
-Read permission follows section 2.5. Missing Channel returns `NOT_FOUND`; denied
-access returns `PERMISSION_DENIED`.
+- Read permission follows section 2.5.
+- A missing Channel returns `NOT_FOUND`.
+- Denied read access returns `PERMISSION_DENIED`.
 
 ### 5.3 ListChannels
 
@@ -577,9 +600,12 @@ rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
 
 - The request must authenticate with `principal + token`, and `principal` must
   be greater than zero.
-
-Pagination is not currently supported. The server filters by read permission and
-then applies ALL, JOINED, or OWNED. Invalid filter returns `INVALID_ARGUMENT`.
+- Pagination is not currently supported.
+- The server filters by read permission before applying the requested filter.
+- `CHANNEL_FILTER_ALL` returns all visible Channels.
+- `CHANNEL_FILTER_JOINED` returns the visible Channels the caller has joined.
+- `CHANNEL_FILTER_OWNED` returns the visible Channels the caller created.
+- An invalid filter returns `INVALID_ARGUMENT`.
 
 ### 5.4 AddMember
 
@@ -589,14 +615,14 @@ rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
 
 - The request must authenticate with `principal + token`; both the operator and
   target principal must be greater than zero.
-
-Only the creator may add members. `channel_id=0` returns `PERMISSION_DENIED`, a
-missing Channel returns `NOT_FOUND`, and an existing member returns `ALREADY_EXISTS`
-without a system message, even when the Channel has reached its total membership
-limit. New members must satisfy the total membership limit in
-[section 5's general rules](#5-channelservice). An actual
-addition writes one member-added system message in that Channel. See the
-[system protocol](SYSTEM_PROTOCOL.md) for the schema and section 2.8 for atomic commitment.
+- Only the Channel creator may add members.
+- `channel_id=0` returns `PERMISSION_DENIED`.
+- A missing Channel returns `NOT_FOUND`.
+- An existing member returns `ALREADY_EXISTS` without a system message, even when
+  the Channel has reached its total membership limit.
+- Adding a member must satisfy the total membership limit in [section 5](#5-channelservice).
+- An actual addition writes one member-added system message in that Channel. See the
+  [system protocol](SYSTEM_PROTOCOL.md) for the schema and section 2.8 for atomic commitment.
 
 ### 5.5 RemoveMember
 
@@ -606,20 +632,21 @@ rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
 
 - The request must authenticate with `principal + token`; both the operator and
   target principal must be greater than zero.
-
-Only the creator may remove members. `channel_id=0` returns `PERMISSION_DENIED`,
-and a missing Channel returns `NOT_FOUND`. The creator cannot be removed. Removing a
-non-member is idempotent success without a system message. An actual removal
-writes one member-removed system message in that Channel. See the
-[system protocol](SYSTEM_PROTOCOL.md) for the schema and section 2.8 for atomic
-commitment. After a successful removal from a protected or private Channel, later
-publishes by the removed principal using an unconsumed UUID return `PERMISSION_DENIED`.
-Removing a member from a public Channel does not change that principal's write permission. System
-messages do not bypass read permissions; see section 2.5.
+- Only the Channel creator may remove members.
+- `channel_id=0` returns `PERMISSION_DENIED`.
+- A missing Channel returns `NOT_FOUND`.
+- The creator cannot be removed.
+- Removing a non-member is idempotent and succeeds without a system message.
+- An actual removal writes one member-removed system message in that Channel. See the
+  [system protocol](SYSTEM_PROTOCOL.md) for the schema and section 2.8 for atomic commitment.
+- After a successful removal from a protected or private Channel, later publishes by the
+  removed principal using an unconsumed UUID return `PERMISSION_DENIED`. Removing a member
+  from a public Channel does not change that principal's write permission. System messages
+  follow the read permissions in section 2.5.
 
 ## 6. AdminService
 
-AdminService is defined in [`proto/admin.proto`](../proto/admin.proto), runs only
+AdminService is defined in [`proto/openevent/sdk/proto/admin.proto`](../proto/openevent/sdk/proto/admin.proto), runs only
 on the admin endpoint, and requires no business credentials from its caller.
 The principal/token fields of AddToken and DeleteToken identify the managed
 credential, not the admin caller. Deployments must protect the endpoint with
@@ -653,14 +680,14 @@ rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
 
 - Does not apply Channel ACL or recipient filtering.
 - from_seq is inclusive; 0 starts scanning at seq 0. The returned page follows
-  this section's limit and response-size budget rules.
+  this section's limit and per-page message byte budget rules.
 - limit is required in `1..1000`.
-- Messages are returned in ascending seq order.
-- A response-size budget may end a page before limit. One message may exceed the
-  soft page budget but remains subject to the gRPC transport limit, and a message
-  deferred by the budget is not skipped by next_seq.
+- Messages are returned in ascending seq order. The per-page message byte budget
+  may end a page before `limit`.
+- One message may exceed the soft page budget and is still subject to the gRPC
+  transport limit. The cursor does not skip a message deferred by the budget.
 - next_seq is the suggested continuation point.
 - last_seq is the highest committed seq observed when the page starts.
 - A cursor beyond the tail returns an empty page and the tail's next position.
   `next_seq > last_seq` means the page has reached its observed tail.
-- Concurrent appends may increase last_seq on later pages.
+- Each page is a consistent view. Concurrent appends may increase `last_seq` on later pages.

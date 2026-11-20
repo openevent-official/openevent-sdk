@@ -5,7 +5,7 @@ package openevent;
 option java_package = "io.openevent";
 option go_package = "openevent/proto;openevent";
 
-import "openevent.proto";
+import "openevent/sdk/proto/openevent.proto";
 
 // ============================================================================
 // AdminService - token management and administrative message queries
