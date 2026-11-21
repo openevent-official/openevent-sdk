@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-import re
+import shutil
 import subprocess
 import venv
 import zipfile
@@ -48,27 +48,93 @@ def python(tmp_path):
     return directory / 'bin/python'
 
 
-def test_make_install_rejects_redirected_pip_config(tmp_path, python):
-    outside = tmp_path / 'redirected'
-    (python.parent.parent / 'pip.conf').write_text(f'[install]\nroot = {outside}\n')
-    # Let pip read the chosen environment's config without loading user settings.
-    empty_config = tmp_path / 'empty-pip.conf'
-    empty_config.touch()
+@pytest.fixture
+def checkout(tmp_path):
+    source = tmp_path / 'checkout'
+    source.mkdir()
+    for name in ('Makefile', 'build.sh'):
+        shutil.copy2(ROOT / name, source / name)
+    shutil.copytree(ROOT / 'scripts', source / 'scripts')
+    return source
+
+
+def test_make_test_env_rejects_redirected_install_before_building(tmp_path, python, checkout):
+    destination = tmp_path / 'redirected'
+    config = tmp_path / 'pip.conf'
+    config.write_text(f'[install]\ntarget = {destination}\n')
     environment = process_environment()
-    environment.update(PIP_CONFIG_FILE=str(empty_config), PIP_NO_INDEX='1')
+    environment.update(PIP_CONFIG_FILE=str(config), PIP_NO_INDEX='1')
     result = subprocess.run(
-        ['make', 'install', f'PYTHON={python}'], cwd=ROOT, env=environment,
+        ['make', 'test-env', f'PYTHON={python}'], cwd=checkout, env=environment,
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     assert result.returncode != 0, result.stdout
-    # A setting can appear as --root, install.root or a bare key in a configuration diagnostic.
-    setting = re.compile(r'(?<![\w/.-])(--|(?:install|global)\.|pip_)?root(?![\w/-])')
-    assert any(
-        match.group(1) or any(word in line for word in ('config', 'setting', 'option'))
-        for line in result.stdout.lower().splitlines()
-        if (match := setting.search(line))
-    ), result.stdout
-    assert not outside.exists()
+    assert 'target' in result.stdout.lower(), result.stdout
+    assert not (checkout / 'build').exists()
+    assert not destination.exists()
+
+
+@pytest.fixture
+def wheelhouse(tmp_path, checkout):
+    # A local build backend keeps the real Make/pip build and install offline.
+    wheels = tmp_path / 'wheelhouse'
+    wheels.mkdir()
+    backend = (
+        'from pathlib import Path\n'
+        'from shutil import copyfile\n'
+        'def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):\n'
+        '    wheel, = Path("input").glob("*.whl")\n'
+        '    copyfile(wheel, Path(wheel_directory) / wheel.name)\n'
+        '    return wheel.name\n'
+    )
+    write_wheel(wheels, 'sdk_fixture_backend', '1', {'sdk_fixture_backend.py': backend})
+    (checkout / 'input').mkdir()
+    (checkout / 'pyproject.toml').write_text(
+        '[build-system]\nrequires = ["sdk_fixture_backend==1"]\nbuild-backend = "sdk_fixture_backend"\n'
+    )
+    return wheels
+
+
+def test_make_build_keeps_build_dependencies_out_of_pip_target(tmp_path, python, checkout, wheelhouse):
+    destination = tmp_path / 'packages'
+    config = tmp_path / 'pip.conf'
+    config.write_text(f'[global]\nno-index = yes\nfind-links = {wheelhouse.as_uri()}\n'
+                      f'[install]\ntarget = {destination}\n')
+    wheel = write_wheel(checkout / 'input', 'openevent_sdk', '1', {'openevent/sdk/__init__.py': ''})
+    environment = process_environment()
+    environment['PIP_CONFIG_FILE'] = str(config)
+    subprocess.run(['make', 'build', f'PYTHON={python}'], cwd=checkout, env=environment, check=True)
+    assert (checkout / 'dist' / wheel.name).is_file()
+    assert not destination.exists()
+
+
+def test_make_install_replaces_same_version_in_user_site(tmp_path, python, checkout, wheelhouse):
+    write_wheel(wheelhouse, 'sdk_fixture_sibling', '1', {'openevent/sibling.py': 'value = 1\n'})
+    destination = tmp_path / 'user base'
+    environment = process_environment()
+    environment.update(PIP_NO_INDEX='1', PIP_FIND_LINKS=wheelhouse.as_uri(),
+                       PIP_USER='1', PYTHONUSERBASE=str(destination))
+
+    def make_install(files):
+        write_wheel(checkout / 'input', 'openevent_sdk', '1', files, requires=('sdk_fixture_sibling>=1',))
+        subprocess.run(['make', 'install', f'PYTHON={python}'], cwd=checkout, env=environment, check=True)
+
+    package_file = 'openevent/sdk/__init__.py'
+    make_install({package_file: 'value = "old"\n', 'openevent/sdk/obsolete.py': ''})
+    project, = destination.rglob(package_file)
+    sibling = project.parents[1] / 'sibling.py'
+    assert (project.parent / 'obsolete.py').is_file()
+    mtime = sibling.stat().st_mtime_ns
+    make_install({package_file: 'value = "new"\n'})
+    imported = subprocess.check_output(
+        [python, '-B', '-c', 'from openevent.sdk import value; print(value)'],
+        cwd=tmp_path, env=environment, text=True,
+    )
+    assert imported.strip() == 'new'
+    assert not (project.parent / 'obsolete.py').exists()
+    assert sibling.read_text() == 'value = 1\n'
+    assert sibling.stat().st_mtime_ns == mtime
+    assert not list(destination.rglob('sdk_fixture_backend.py'))
 
 
 def test_same_version_replaces_sdk_and_resolves_only_needed_dependencies(tmp_path, python):

@@ -15,7 +15,7 @@ export TMPDIR="$PWD/build/tmp"
 mkdir -p "$TMPDIR" dist
 output=$(mktemp -d "$TMPDIR/wheel.XXXXXXXX")
 trap 'rm -r -- "$output"' EXIT
-"$python" -B -m pip wheel --no-deps --wheel-dir "$output" .
+"$python" -B scripts/build_wheel.py "$output"
 
 shopt -s nullglob
 wheels=("$output"/openevent_sdk-*.whl)
